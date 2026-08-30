@@ -144,6 +144,22 @@ def batch_launch_command(
         str(max(1, int(count))),
         str(max(1, int(workers))),
     ]
+    return wrap_browser_command(
+        command,
+        platform_name=platform_name,
+        environ=environ,
+        which=which,
+    )
+
+
+def wrap_browser_command(
+    command: list[str],
+    *,
+    platform_name: str | None = None,
+    environ: Mapping[str, str] | None = None,
+    which: Callable[[str], str | None] = shutil.which,
+) -> list[str]:
+    """Prefix xvfb-run when Linux has no DISPLAY (same as main batch register)."""
     error = batch_runtime_error(
         platform_name=platform_name,
         environ=environ,
@@ -152,7 +168,7 @@ def batch_launch_command(
     if error:
         raise RuntimePlatformError(error)
     if not _needs_xvfb(platform_name=platform_name, environ=environ):
-        return command
+        return list(command)
     xvfb = which("xvfb-run")
     if not xvfb:
         raise RuntimePlatformError("找不到 xvfb-run")

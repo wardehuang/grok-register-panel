@@ -238,6 +238,39 @@ def test_disable_delete_and_legacy_import():
         assert deleted["summary"]["total"] == 1
 
 
+def test_reorder_persists_and_managed_projection_overwrites_legacy_file():
+    with IsolatedStore() as base:
+        imported = proxy_store.import_proxies(
+            "http://a.example:8000\nhttp://b.example:8001\nhttp://c.example:8002"
+        )
+        requested = [
+            imported["imported_ids"][2],
+            imported["imported_ids"][0],
+            imported["imported_ids"][1],
+        ]
+        reordered = proxy_store.reorder_proxies(requested)
+        assert [item["id"] for item in reordered["items"]] == requested
+        assert reordered["reordered"] is True
+
+        for proxy_id in requested:
+            proxy_store._apply_probe_result(
+                proxy_id,
+                {
+                    "ok": True,
+                    "exit_ip": "198.51.100.40",
+                    "asn": 64500,
+                    "asn_org": "Test",
+                    "latency_ms": 50,
+                    "checked_at": "2026-08-20T00:00:00Z",
+                },
+            )
+
+        proxy_store.LEGACY_PATH.write_text("http://stale.example:9999\n", encoding="utf-8")
+        target = proxy_store.sync_worker_proxy_file(base / "proxies.txt")
+        assert target == base / "proxies.txt"
+        assert target.read_text(encoding="utf-8").splitlines() == proxy_store.list_worker_proxies()
+
+
 def test_async_probe_job_persists_health():
     with IsolatedStore():
         result = proxy_store.import_proxies("http://proxy.example:8080")

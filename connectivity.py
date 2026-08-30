@@ -249,11 +249,39 @@ def check_email_api(provider: str, config: dict, http_get: Callable, http_post: 
         if provider == "outlook_rt":
             from email_providers import outlook_rt as outlook_rt_provider
 
-            inv = str(config.get("outlook_rt_inventory") or "").strip()
+            inv = str(
+                config.get("outlook_accounts_file")
+                or config.get("outlook_rt_inventory")
+                or ""
+            ).strip()
             if not inv:
-                return "邮箱API", False, "未配置 outlook_rt_inventory"
-            used = str(config.get("outlook_rt_used_path") or "").strip()
+                return "邮箱API", False, "未配置 outlook_accounts_file"
+            # alias pool uses outlook_state.json; probe still accepts used path for legacy jsonl mode
+            used = str(
+                config.get("outlook_state_file")
+                or config.get("outlook_rt_used_path")
+                or ""
+            ).strip()
             client_id = str(config.get("outlook_rt_client_id") or "").strip()
+            # alias inventory is txt not jsonl — short-circuit count check
+            from pathlib import Path as _P
+            inv_path = _P(inv)
+            if not inv_path.is_absolute():
+                inv_path = (_P(__file__).resolve().parent / inv_path)
+            if inv_path.suffix.lower() in {".txt", ""} or "outlook_accounts" in inv_path.name:
+                if not inv_path.is_file():
+                    return "邮箱API", False, f"库存文件不存在: {inv}"
+                lines = [
+                    ln.strip()
+                    for ln in inv_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                    if ln.strip() and not ln.strip().startswith("#")
+                ]
+                valid = [ln for ln in lines if ln.count("----") >= 3 and "@" in ln.split("----", 1)[0]]
+                return (
+                    "邮箱API",
+                    bool(valid),
+                    f"Outlook 别名库存 {len(valid)} 条" + ("" if valid else "（空）"),
+                )
             detail = outlook_rt_provider.probe_inventory(
                 http_post,
                 inv,

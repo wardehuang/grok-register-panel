@@ -25,6 +25,8 @@ from browser_session import (
 )
 
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
+SIGNIN_URL = "https://accounts.x.ai/sign-in?redirect=grok-com"
+SIGNIN_URL_EMAIL = "https://accounts.x.ai/sign-in?redirect=grok-com&email=true"
 
 
 def _hint_is_page_error(hint: str) -> bool:
@@ -662,15 +664,14 @@ return candidates[0].text || true;
     raise Exception("未找到「使用邮箱注册」按钮")
 
 
-def open_signup_page(log_callback=None, cancel_callback=None):
+def _open_accounts_url(url: str, *, fail_label: str, log_callback=None, cancel_callback=None):
     raise_if_cancelled(cancel_callback)
     if active_browser() is None:
         start_browser(log_callback=log_callback)
         if log_callback:
             log_callback("[*] 浏览器已启动")
 
-    def _navigate_signup():
-        # 优先复用已有标签，避免反复 new_tab 堆积空窗口
+    def _navigate():
         browser_obj = active_browser()
         if browser_obj is None:
             start_browser(log_callback=log_callback)
@@ -681,31 +682,37 @@ def open_signup_page(log_callback=None, cancel_callback=None):
         except Exception:
             page_obj = browser_obj.new_tab()
         set_browser_session(browser_obj, page_obj)
-        page_obj.get(SIGNUP_URL)
+        page_obj.get(url)
         page_obj.wait.doc_loaded()
-        # 确认真的进了注册域；about:blank / 错页直接失败
         current = str(getattr(page_obj, "url", "") or "")
         if "accounts.x.ai" not in current and "x.ai" not in current:
-            raise Exception(f"打开注册页失败，当前URL: {current or 'empty'}")
+            raise Exception(f"{fail_label}失败，当前URL: {current or 'empty'}")
 
     try:
-        _navigate_signup()
+        _navigate()
     except Exception as e:
         if log_callback:
             log_callback(f"[Debug] 打开URL异常: {e}")
         try:
             restart_browser(log_callback=log_callback)
-            _navigate_signup()
+            _navigate()
         except Exception as e2:
-            # 导航彻底失败：关掉残留实例，避免空浏览器挂着
             try:
                 stop_browser()
             except Exception:
                 pass
-            raise Exception(f"打开注册页失败: {e2}") from e2
+            raise Exception(f"{fail_label}失败: {e2}") from e2
 
-    # 等 SPA/CF 把壳渲染出来，再点邮箱注册
     sleep_with_cancel(1.0, cancel_callback)
+
+
+def open_signup_page(log_callback=None, cancel_callback=None):
+    _open_accounts_url(
+        SIGNUP_URL,
+        fail_label="打开注册页",
+        log_callback=log_callback,
+        cancel_callback=cancel_callback,
+    )
     if log_callback:
         log_callback(f"[*] 当前URL: {active_page().url if active_page() else ''}")
     if not _wait_signup_shell(timeout=8, log_callback=log_callback, cancel_callback=cancel_callback):
@@ -730,6 +737,53 @@ def open_signup_page(log_callback=None, cancel_callback=None):
             raise Exception(
                 f"未找到邮箱输入框或注册按钮，最后页面: url={active_page().url if active_page() else ''}; inputs=none; buttons=none"
             )
+
+
+def open_signin_page(log_callback=None, cancel_callback=None, *, email_first: bool = False):
+    """打开 xAI 登录页（批量重登用）。email_first=True 时直接进邮箱登录步。"""
+    _open_accounts_url(
+        SIGNIN_URL_EMAIL if email_first else SIGNIN_URL,
+        fail_label="打开登录页",
+        log_callback=log_callback,
+        cancel_callback=cancel_callback,
+    )
+    if log_callback:
+        try:
+            cur = active_page().url if active_page() else ""
+        except Exception:
+            cur = ""
+        log_callback(f"[*] 登录页 URL: {cur}")
+
+
+def login_and_get_sso(
+    email: str,
+    password: str,
+    *,
+    log_callback=None,
+    cancel_callback=None,
+    timeout: int = 120,
+) -> str:
+    """用已有账号密码登录并拿 sso cookie。复用 wait_for_sso_cookie 自动登录逻辑。"""
+    email_s = str(email or "").strip()
+    password_s = str(password or "").strip()
+    if not email_s or "@" not in email_s:
+        raise Exception("login_and_get_sso: email 无效")
+    if not password_s:
+        raise Exception("login_and_get_sso: password 为空")
+    open_signin_page(
+        log_callback=log_callback,
+        cancel_callback=cancel_callback,
+        email_first=True,
+    )
+    if log_callback:
+        log_callback(f"[*] 开始重登拿 SSO: {email_s}")
+    return wait_for_sso_cookie(
+        timeout=max(45, int(timeout or 120)),
+        log_callback=log_callback,
+        cancel_callback=cancel_callback,
+        email=email_s,
+        password=password_s,
+    )
 
 
 def has_profile_form(log_callback=None):
@@ -1731,7 +1785,18 @@ def build_profile():
     ]
     given_name = random.choice(given_name_pool)
     family_name = random.choice(family_name_pool)
-    password = "N" + secrets.token_hex(4) + "!a7#" + secrets.token_urlsafe(6)
+    # token_urlsafe 含 -/_；密码不得含 "----"，且避免以 '-' 结尾以免
+    # email----password----sso 在旧 split 解析下边界错位。
+    for _ in range(12):
+        tail = secrets.token_urlsafe(6).replace("-", "x")
+        password = "N" + secrets.token_hex(4) + "!a7#" + tail
+        if "----" in password:
+            continue
+        if password.endswith("-"):
+            password = password + "x"
+        break
+    else:
+        password = "N" + secrets.token_hex(8) + "!a7#x"
     return given_name, family_name, password
 
 
@@ -2447,17 +2512,59 @@ return { okEmail, okPwd, hasEmail: !!emailInput, hasPwd: !!pwdInput };
             )
             if log_callback:
                 log_callback(f"[*] 登录页仅有邮箱，先点继续: {clicked_next or 'no-button'}")
-            for _ in range(8):
-                sleep_with_cancel(0.35, cancel_callback)
+            for _ in range(16):
+                sleep_with_cancel(0.4, cancel_callback)
                 fields = _signin_fields()
                 if isinstance(fields, dict) and fields.get("hasPwd"):
                     break
+            # 密码框出现后再填（原生 + JS）
             try:
                 pwd_cands = _native_input_candidates("password")
                 if pwd_cands:
                     filled_pwd = _native_type_element(pwd_cands[0], password_s)
             except Exception:
                 filled_pwd = False
+            if not filled_pwd:
+                try:
+                    js_pwd = page.run_js(
+                        r"""
+const password = String(arguments[0] || '');
+function isVisible(node) {
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+function setInputValue(input, value) {
+  if (!input) return false;
+  input.focus();
+  input.click();
+  const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+  const tracker = input._valueTracker;
+  if (tracker) tracker.setValue('');
+  if (nativeSetter) nativeSetter.call(input, value);
+  else input.value = value;
+  input.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, data: value, inputType: 'insertText' }));
+  input.dispatchEvent(new InputEvent('input', { bubbles: true, data: value, inputType: 'insertText' }));
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+  return String(input.value || '').length > 0;
+}
+const pwdInput = Array.from(document.querySelectorAll(
+  'input[type="password"], input[name="password"], input[autocomplete="current-password"]'
+)).find(isVisible) || null;
+return setInputValue(pwdInput, password);
+                        """,
+                        password_s,
+                    )
+                    filled_pwd = bool(js_pwd)
+                except Exception:
+                    pass
+            if log_callback:
+                log_callback(
+                    f"[*] 继续后密码框={'有' if (isinstance(fields, dict) and fields.get('hasPwd')) else '无'} "
+                    f"filled_pwd={bool(filled_pwd)}"
+                )
 
         if not filled_pwd:
             if log_callback:
@@ -2509,13 +2616,50 @@ return (btn.innerText || btn.textContent || 'submit').trim().slice(0, 40);
                 clicked = ""
         if clicked and log_callback:
             log_callback(f"[*] 自动登录已点击: {clicked}")
-        # 短轮询几次，不硬睡
-        for _ in range(4):
-            sleep_with_cancel(0.35, cancel_callback)
+        # 提交后多等一会儿：读错误文案 + 等 sso
+        for i in range(12):
+            sleep_with_cancel(0.5, cancel_callback)
             sso_val, names = _read_sso_from_cookies()
             last_seen_names.update(names)
             if sso_val:
                 return sso_val
+            if i in (1, 4, 8):
+                err = ""
+                try:
+                    err = str(
+                        page.run_js(
+                            r"""
+function isVisible(node) {
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  if (style.display === 'none' || style.visibility === 'hidden') return false;
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+const sels = ['[role="alert"]','[data-testid*="error" i]','[class*="error" i]','[class*="Error"]','p','span','div'];
+const chunks = [];
+for (const sel of sels) {
+  for (const node of Array.from(document.querySelectorAll(sel)).slice(0, 40)) {
+    if (!isVisible(node)) continue;
+    const t = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+    if (t && t.length >= 6 && t.length <= 240) chunks.push(t);
+  }
+}
+const body = ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ').trim().slice(0, 800);
+const all = Array.from(new Set(chunks.concat(body ? [body] : [])));
+const re = /(incorrect|invalid|wrong|password|密码|错误|失败|unable|try again|too many|blocked|suspended|验证)/i;
+for (const t of all) {
+  if (re.test(t)) return t.slice(0, 180);
+}
+return '';
+                            """
+                        )
+                        or ""
+                    ).strip()
+                except Exception:
+                    err = ""
+                if err and log_callback:
+                    log_callback(f"[!] 登录页提示: {err}")
         return ""
 
     def _click_continue_if_any(strict: bool = False):

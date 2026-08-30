@@ -15,7 +15,7 @@ ExecStart=/opt/grok-register-panel/.venv/bin/python -u /opt/grok-register-panel/
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=15
-KillMode=process
+KillMode=control-group
 
 [Install]
 WantedBy=multi-user.target

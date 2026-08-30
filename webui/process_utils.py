@@ -118,6 +118,11 @@ def find_managed_processes(
             ad_value=None,
         )
         for process in iterator:
+            try:
+                if process.status() == psutil.STATUS_ZOMBIE:
+                    continue
+            except PROCESS_ERRORS:
+                continue
             snapshot = _process_snapshot(process)
             if not snapshot or not _snapshot_matches(snapshot, root, script_names):
                 continue

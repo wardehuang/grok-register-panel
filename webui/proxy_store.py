@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 
 try:
-    from secure_files import atomic_write_json, exclusive_file_lock
+    from secure_files import atomic_write_json, atomic_write_text, exclusive_file_lock
     from webui.security_utils import redact_log_line, redact_proxy
 except ImportError:  # running from webui/
     import sys
@@ -22,7 +22,7 @@ except ImportError:  # running from webui/
     ROOT = Path(__file__).resolve().parent.parent
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
-    from secure_files import atomic_write_json, exclusive_file_lock
+    from secure_files import atomic_write_json, atomic_write_text, exclusive_file_lock
     from security_utils import redact_log_line, redact_proxy  # type: ignore
 
 
@@ -641,6 +641,33 @@ def delete_proxy(proxy_id: str) -> dict:
     return result
 
 
+def reorder_proxies(proxy_ids: object) -> dict:
+    if not isinstance(proxy_ids, list):
+        raise ProxyValidationError("ids 必须是代理 ID 数组")
+    requested = [str(value or "").strip() for value in proxy_ids]
+    if any(not value for value in requested):
+        raise ProxyValidationError("代理 ID 不能为空")
+    if len(requested) != len(set(requested)):
+        raise ProxyValidationError("代理 ID 不能重复")
+
+    changed = False
+    with exclusive_file_lock(LOCK_PATH):
+        state, _ = _read_unlocked()
+        current_items = state["items"]
+        current_ids = [item["id"] for item in current_items]
+        if len(requested) != len(current_ids) or set(requested) != set(current_ids):
+            raise ProxyValidationError("代理池已变化，请刷新后重试")
+        changed = requested != current_ids
+        if changed:
+            items_by_id = {item["id"]: item for item in current_items}
+            state["items"] = [items_by_id[item_id] for item_id in requested]
+            _write_unlocked(state)
+
+    result = read_proxy_pool()
+    result["reordered"] = changed
+    return result
+
+
 def worker_proxy_snapshot() -> dict:
     """Return secret worker URLs plus whether a managed pool is configured."""
     with exclusive_file_lock(LOCK_PATH):
@@ -659,6 +686,19 @@ def worker_proxy_snapshot() -> dict:
 def list_worker_proxies() -> list[str]:
     """Return only enabled, currently healthy proxy URLs with credentials."""
     return list(worker_proxy_snapshot()["urls"])
+
+
+def sync_worker_proxy_file(path: str | Path) -> Path | None:
+    """Project the managed pool order into the cursor file when configured."""
+    target = Path(path)
+    snapshot = worker_proxy_snapshot()
+    if not snapshot["configured"]:
+        if target.is_file() and target.stat().st_size > 0:
+            return target
+        return None
+    urls = [str(url).strip() for url in snapshot["urls"] if str(url).strip()]
+    atomic_write_text(target, "".join(f"{url}\n" for url in urls))
+    return target
 
 
 def mark_proxy_used(url: object) -> bool:

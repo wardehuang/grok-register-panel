@@ -18,11 +18,13 @@ import hashlib
 import json
 import os
 import secrets
+import socket
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from email_providers.common import extract_verification_code
 from secure_files import (
@@ -82,6 +84,46 @@ ACCESS_TOKEN_SKEW_SECONDS = 90
 WAIT_HEARTBEAT_SECONDS = 15
 # Graph 连续空箱这么久就提前放弃，避免 180s 空耗；不记 used，库存可再领
 EMPTY_INBOX_ABORT_SECONDS = 20
+# 单次 token HTTP 超时；部分主机 IPv6 黑洞时避免 UI/worker 长时间无响应
+TOKEN_HTTP_TIMEOUT_SECONDS = max(
+    5, int(os.environ.get("OUTLOOK_RT_TOKEN_HTTP_TIMEOUT", "12") or 12)
+)
+# 连通性探测总预算，避免面板“正在测试连通性”一直转圈
+PROBE_DEADLINE_SECONDS = max(
+    8, int(os.environ.get("OUTLOOK_RT_PROBE_DEADLINE", "25") or 25)
+)
+
+
+@contextmanager
+def _prefer_ipv4() -> Iterator[None]:
+    """Prefer IPv4 for urllib3/requests during Microsoft token calls.
+
+    Some hosts resolve login.microsoftonline.com to broken IPv6 first; the
+    connect then hangs until TCP timeout and freezes panel connectivity tests.
+    """
+    try:
+        import urllib3.util.connection as urllib3_cn
+    except Exception:
+        yield
+        return
+    previous = getattr(urllib3_cn, "allowed_gai_family", None)
+
+    def _ipv4_only() -> int:
+        return socket.AF_INET
+
+    urllib3_cn.allowed_gai_family = _ipv4_only  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        if previous is None:
+            try:
+                delattr(urllib3_cn, "allowed_gai_family")
+            except Exception:
+                urllib3_cn.allowed_gai_family = socket.AF_UNSPEC  # type: ignore[assignment]
+        else:
+            urllib3_cn.allowed_gai_family = previous  # type: ignore[assignment]
+
+
 CODE_KEYWORDS = (
     "x.ai",
     "xai",
@@ -511,15 +553,16 @@ def refresh_access_token(
                             "grant_type": "refresh_token",
                             **extra,
                         }
-                        resp = http_post(
-                            url,
-                            data=data,
-                            headers={
-                                "Content-Type": "application/x-www-form-urlencoded",
-                                "Accept": "application/json",
-                            },
-                            timeout=30,
-                        )
+                        with _prefer_ipv4():
+                            resp = http_post(
+                                url,
+                                data=data,
+                                headers={
+                                    "Content-Type": "application/x-www-form-urlencoded",
+                                    "Accept": "application/json",
+                                },
+                                timeout=TOKEN_HTTP_TIMEOUT_SECONDS,
+                            )
                         token_data: Dict[str, Any] = {}
                         try:
                             token_data = resp.json() if hasattr(resp, "json") else {}
@@ -591,6 +634,53 @@ def refresh_access_token(
             if access:
                 return access
         raise RuntimeError(f"Outlook RT refresh 失败: {_safe_error(last_err)}")
+
+
+
+def bind_external_session(
+    *,
+    alias_email: str,
+    account: Dict[str, str],
+    lease_token: str = "",
+    default_client_id: str = "",
+    alias_mode: bool = True,
+) -> str:
+    """Bind a pre-allocated alias session into the RT token map.
+
+    account must include primary mailbox email + refresh_token (+ client_id).
+    alias_email is the address submitted to xAI.
+    """
+    email = str(alias_email or "").strip()
+    if not email or "@" not in email:
+        raise Exception("alias_email 无效")
+    acc = dict(account or {})
+    if not acc.get("email"):
+        raise Exception("primary account.email 缺失")
+    if not acc.get("refresh_token"):
+        raise Exception("primary refresh_token 缺失")
+    if not acc.get("client_id") and default_client_id:
+        acc["client_id"] = default_client_id
+    token_key = "outlook_alias:" + secrets.token_urlsafe(12)
+    with _lock:
+        _token_map[token_key] = {
+            "account": acc,
+            "email": email,
+            "inventory_path": "",
+            "used_path": "",
+            "default_client_id": default_client_id or DEFAULT_CLIENT_ID,
+            "created_at": time.time(),
+            "refresh_failures": 0,
+            "alias_mode": bool(alias_mode),
+            "lease_token": str(lease_token or ""),
+            "primary_email": str(acc.get("email") or ""),
+        }
+        _reserved.add(email.lower())
+    return token_key
+
+
+def peek_session(token_key: str = "", email: str = "") -> Dict[str, Any]:
+    info = _resolve_session(token_key, email)
+    return dict(info)
 
 
 def take_mailbox(
@@ -987,6 +1077,9 @@ def _wait_for_code_unlocked(
         empty_limit = EMPTY_INBOX_ABORT_SECONDS
 
     def _retire(reason: str) -> None:
+        if info.get("alias_mode"):
+            release_reservation(token_key, email)
+            return
         if not inventory_path:
             return
         try:
@@ -1049,7 +1142,7 @@ def _wait_for_code_unlocked(
             continue
         code = find_code_in_messages(messages, seen=seen, after_ts=after_ts)
         if code:
-            if mark_on_success and inventory_path:
+            if mark_on_success and inventory_path and not info.get("alias_mode"):
                 try:
                     mark_used(mailbox, inventory_path, used_path, reason="code_ok")
                 except Exception as exc:
@@ -1142,6 +1235,7 @@ def probe_inventory(
         return f"库存 total={stats['total']} available=0（请补充 jsonl 或清理 used）"
     email = ""
     token_key = ""
+    started = time.time()
     try:
         email, token_key = take_mailbox(
             inventory_path,
@@ -1149,11 +1243,27 @@ def probe_inventory(
             default_client_id=default_client_id,
         )
         sample = dict(_resolve_session(token_key, email)["account"])
+
+        def _bounded_http_post(url, **kwargs):
+            # 给探测路径强制短超时，避免面板请求线程被拖死
+            timeout = kwargs.get("timeout", TOKEN_HTTP_TIMEOUT_SECONDS)
+            try:
+                timeout_f = float(timeout)
+            except Exception:
+                timeout_f = float(TOKEN_HTTP_TIMEOUT_SECONDS)
+            remaining = PROBE_DEADLINE_SECONDS - (time.time() - started)
+            if remaining <= 1:
+                raise TimeoutError("outlook_rt probe deadline exceeded")
+            kwargs["timeout"] = max(1.0, min(timeout_f, remaining))
+            with _prefer_ipv4():
+                return http_post(url, **kwargs)
+
         access = refresh_access_token(
-            http_post,
+            _bounded_http_post,
             sample,
             inventory_path=inventory_path,
             default_client_id=default_client_id or DEFAULT_CLIENT_ID,
+            persist_refresh=True,
         )
         return (
             f"库存 total={stats['total']} available={stats['available']}；"
@@ -1167,3 +1277,43 @@ def probe_inventory(
     finally:
         if token_key:
             release_reservation(token_key, email)
+
+
+def probe_inventory_accounts(
+    http_get: HttpGet,
+    http_post: HttpPost,
+    inventory_path: str,
+    *,
+    default_client_id: str = "",
+) -> List[Dict[str, str]]:
+    """逐账号检查 RT 刷新与 Graph Inbox，不领取、不标记库存。"""
+    accounts = load_inventory(inventory_path)
+    results: List[Dict[str, str]] = []
+    for account in accounts:
+        email = account["email"]
+        result: Dict[str, str] = {
+            "email": email,
+            "refresh": "fail",
+            "graph": "skip",
+            "inbox": "-",
+            "error": "",
+        }
+        try:
+            access = refresh_access_token(
+                http_post,
+                account,
+                inventory_path=inventory_path,
+                default_client_id=default_client_id or DEFAULT_CLIENT_ID,
+                persist_refresh=True,
+            )
+            result["refresh"] = "ok"
+            try:
+                result["inbox"] = str(inbox_total_count(http_get, access))
+                result["graph"] = "ok"
+            except Exception as exc:
+                result["graph"] = "fail"
+                result["error"] = _safe_error(exc)
+        except Exception as exc:
+            result["error"] = _safe_error(exc)
+        results.append(result)
+    return results

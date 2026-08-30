@@ -130,8 +130,46 @@ def test_unknown_state_continues_without_quarantine():
     assert quarantined == []
 
 
+def test_only_cpa_skips_grok2api_and_keeps_risk_and_cpa():
+    previous_functions = (
+        register.push_sso_to_grok2api_remotes,
+        register.ensure_sso_oauth_eligible,
+        register.add_sso_to_cpa,
+    )
+    pushed = []
+    risk_checked = []
+    cpa_pushed = []
+    register.push_sso_to_grok2api_remotes = (
+        lambda *_args, **_kwargs: pushed.append(True) or {}
+    )
+    register.ensure_sso_oauth_eligible = (
+        lambda sso, **_kwargs: risk_checked.append(sso) or {}
+    )
+    register.add_sso_to_cpa = (
+        lambda sso, **_kwargs: cpa_pushed.append(sso) or True
+    )
+    try:
+        result = register.finalize_sso_after_register(
+            "sso=only-cpa-token",
+            email="only-cpa@example.test",
+            only_cpa=True,
+        )
+    finally:
+        (
+            register.push_sso_to_grok2api_remotes,
+            register.ensure_sso_oauth_eligible,
+            register.add_sso_to_cpa,
+        ) = previous_functions
+
+    assert result is True
+    assert pushed == []
+    assert risk_checked == ["only-cpa-token"]
+    assert cpa_pushed == ["only-cpa-token"]
+
+
 if __name__ == "__main__":
     test_registration_risk_policy()
     test_risk_gate_runs_when_cpa_auto_add_is_disabled()
     test_unknown_state_continues_without_quarantine()
+    test_only_cpa_skips_grok2api_and_keeps_risk_and_cpa()
     print("OK registration risk gate")

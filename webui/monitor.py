@@ -12,7 +12,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -37,6 +37,7 @@ try:
         import_legacy_proxies,
         import_proxies,
         read_proxy_pool,
+        reorder_proxies,
         start_proxy_tests,
         update_proxy,
     )
@@ -53,12 +54,43 @@ try:
         save_email_provider_config,
         test_email_provider_config,
     )
+    from webui.outlook_inventory_store import (
+        OutlookInventoryError,
+        read_inventory as read_outlook_inventory,
+        read_state as read_outlook_state,
+        read_state_raw as read_outlook_state_raw,
+        write_inventory as write_outlook_inventory,
+        write_state as write_outlook_state,
+    )
+    from webui.integrations_store import (
+        latest_run_log_tail,
+        read_public_config as read_integration_config,
+        save_integration_config,
+        IntegrationConfigError,
+        test_cpa_connectivity,
+        test_g2a_connectivity,
+        run_dry_run,
+    )
+    from webui.auth_files_store import (
+        AuthFilesError,
+        list_auth_files,
+        read_auth_file,
+        read_auth_zip,
+    )
+    from webui.registered_accounts_store import (
+        RegisteredAccountsError,
+        collect_registered_accounts,
+        export_registered_emails_text,
+        overwrite_registered_emails,
+        read_one_registered_line,
+    )
     from webui.process_utils import (
         find_managed_processes,
         terminate_managed_processes,
         write_pid_file,
     )
     from webui.recovery_ops import recovery_status, start_recovery, stop_recovery
+    from webui.batch_relogin_ops import relogin_status, start_relogin, stop_relogin
     from webui.bfs_ops import bfs_status, check_token_text, run_bfs_scan
     from webui.sso_state_ops import (
         read_sso_state_export,
@@ -80,6 +112,7 @@ except ImportError:  # running as script from webui/
         import_legacy_proxies,
         import_proxies,
         read_proxy_pool,
+        reorder_proxies,
         start_proxy_tests,
         update_proxy,
     )
@@ -96,12 +129,43 @@ except ImportError:  # running as script from webui/
         save_email_provider_config,
         test_email_provider_config,
     )
+    from outlook_inventory_store import (  # type: ignore
+        OutlookInventoryError,
+        read_inventory as read_outlook_inventory,
+        read_state as read_outlook_state,
+        read_state_raw as read_outlook_state_raw,
+        write_inventory as write_outlook_inventory,
+        write_state as write_outlook_state,
+    )
+    from integrations_store import (  # type: ignore
+        latest_run_log_tail,
+        read_public_config as read_integration_config,
+        save_integration_config,
+        IntegrationConfigError,
+        test_cpa_connectivity,
+        test_g2a_connectivity,
+        run_dry_run,
+    )
+    from auth_files_store import (  # type: ignore
+        AuthFilesError,
+        list_auth_files,
+        read_auth_file,
+        read_auth_zip,
+    )
+    from registered_accounts_store import (  # type: ignore
+        RegisteredAccountsError,
+        collect_registered_accounts,
+        export_registered_emails_text,
+        overwrite_registered_emails,
+        read_one_registered_line,
+    )
     from process_utils import (  # type: ignore
         find_managed_processes,
         terminate_managed_processes,
         write_pid_file,
     )
     from recovery_ops import recovery_status, start_recovery, stop_recovery  # type: ignore
+    from batch_relogin_ops import relogin_status, start_relogin, stop_relogin  # type: ignore
     from bfs_ops import bfs_status, check_token_text, run_bfs_scan  # type: ignore
     from sso_state_ops import (  # type: ignore
         read_sso_state_export,
@@ -248,11 +312,11 @@ def save_control(updates: dict) -> dict:
         except Exception:
             c["risk_pause"] = 10
         try:
-            c["batch_count"] = max(1, min(200, int(c.get("batch_count", 40))))
+            c["batch_count"] = max(1, min(5000, int(c.get("batch_count", 40))))
         except Exception:
             c["batch_count"] = 40
         try:
-            c["add_count"] = max(1, min(2000, int(c.get("add_count", 40))))
+            c["add_count"] = max(1, min(5000, int(c.get("add_count", 40))))
         except Exception:
             c["add_count"] = 40
         c["mode"] = c.get("mode") if c.get("mode") in ("orch", "batch") else "orch"
@@ -705,6 +769,8 @@ def _start_orch_unlocked():
         return {"ok": False, "error": "already running", "process": proc}
     if _find_managed_processes(("sso_to_auth_json.py",)):
         return {"ok": False, "error": "account recovery is running"}
+    if _find_managed_processes(("run_batch_relogin.py",)):
+        return {"ok": False, "error": "batch relogin is running"}
     prerequisite_error = _runtime_prerequisite_error()
     if prerequisite_error:
         return {"ok": False, "error": prerequisite_error}
@@ -779,6 +845,8 @@ def _start_batch_only_unlocked():
         return {"ok": False, "error": "already running", "process": proc}
     if _find_managed_processes(("sso_to_auth_json.py",)):
         return {"ok": False, "error": "account recovery is running"}
+    if _find_managed_processes(("run_batch_relogin.py",)):
+        return {"ok": False, "error": "batch relogin is running"}
     prerequisite_error = _runtime_prerequisite_error()
     if prerequisite_error:
         return {"ok": False, "error": prerequisite_error}
@@ -1392,14 +1460,15 @@ HTML = r"""<!DOCTYPE html>
   .proxy-list-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 10px; }
   .proxy-list-head h2 { margin: 0; font-size: 13px; }
   .proxy-table-wrap { overflow: auto; border: 1px solid var(--border); background: var(--surface-raised); }
-  .proxy-table { min-width: 990px; table-layout: fixed; }
+  .proxy-table { min-width: 1180px; table-layout: fixed; }
   .proxy-table th:nth-child(1) { width: 82px; }
-  .proxy-table th:nth-child(2) { width: 260px; }
-  .proxy-table th:nth-child(3) { width: 150px; }
-  .proxy-table th:nth-child(4) { width: 86px; }
-  .proxy-table th:nth-child(5) { width: 180px; }
-  .proxy-table th:nth-child(6) { width: 96px; }
-  .proxy-table th:nth-child(7) { width: 190px; }
+  .proxy-table th:nth-child(2) { width: 82px; }
+  .proxy-table th:nth-child(3) { width: 260px; }
+  .proxy-table th:nth-child(4) { width: 150px; }
+  .proxy-table th:nth-child(5) { width: 86px; }
+  .proxy-table th:nth-child(6) { width: 180px; }
+  .proxy-table th:nth-child(7) { width: 70px; }
+  .proxy-table th:nth-child(8) { width: 220px; }
   .proxy-endpoint { overflow-wrap: anywhere; }
   .proxy-meta { margin-top: 3px; color: var(--muted); font-size: 10px; }
   .proxy-state {
@@ -1419,6 +1488,10 @@ HTML = r"""<!DOCTYPE html>
   .proxy-state.testing { border-color: color-mix(in srgb, var(--accent) 55%, var(--border)); color: var(--accent); }
   .proxy-actions { display: flex; align-items: center; gap: 6px; }
   .proxy-actions button { min-height: 30px; padding: 5px 9px; font-size: 11px; }
+  .proxy-order { display: flex; flex-direction: column; align-items: center; gap: 5px; }
+  .proxy-order-index { color: var(--text-secondary); font-family: "Geist Mono", monospace; font-size: 12px; }
+  .proxy-order-actions { display: flex; gap: 4px; }
+  .proxy-order-actions button { min-height: 25px; padding: 3px 6px; font-size: 10px; }
   .proxy-toggle { width: 16px; height: 16px; min-height: 0; accent-color: var(--accent); }
   .proxy-empty { padding: 38px 18px !important; color: var(--muted); text-align: center; }
   .proxy-job { color: var(--muted); font-size: 11px; }
@@ -2013,11 +2086,11 @@ HTML = r"""<!DOCTYPE html>
     <div class="control-grid">
       <div class="field field-token">
         <label for="monitor-token">访问令牌</label>
-        <input id="monitor-token" type="password" autocomplete="off" placeholder="MONITOR_TOKEN" onchange="getToken(); refresh(); refreshRecovery(); refreshProxies(); refreshEmailProvider(); refreshEmailDomains(); refreshSsoState(); refreshBfs()" onblur="getToken()"/>
+        <input id="monitor-token" type="password" autocomplete="off" placeholder="MONITOR_TOKEN" onchange="getToken(); refresh(); refreshRecovery(); refreshProxies(); refreshEmailProvider(); refreshEmailDomains(); refreshSsoState(); refreshBfs(); refreshIntegrations(); refreshAuthFiles('cpa'); refreshRunLog(true); refreshRegisteredEmails(); refreshBatchRelogin()" onblur="getToken()"/>
       </div>
       <div class="field field-mode">
         <label for="mode">运行模式</label>
-        <select id="mode">
+        <select id="mode" onchange="syncModeFields()">
           <option value="orch">持续编排</option>
           <option value="batch">单批运行</option>
         </select>
@@ -2026,13 +2099,13 @@ HTML = r"""<!DOCTYPE html>
         <input type="number" id="workers-input" min="1" max="24" value="3"/>
       </div>
       <div class="field"><label for="batch_count">单批数量</label>
-        <input type="number" id="batch_count" min="1" max="200" value="40"/>
+        <input type="number" id="batch_count" min="1" max="5000" value="40" title="单批运行：本批最多注册 N 个；别名耗尽会提前停"/>
       </div>
       <div class="field"><label for="add_count">追加目标</label>
-        <input type="number" id="add_count" min="1" max="2000" value="40" title="每次启动从当前 CPA 再注册 N 个"/>
+        <input type="number" id="add_count" min="1" max="5000" value="40" title="仅持续编排：从当前 CPA 数再追加 N 个成功目标"/>
       </div>
       <div class="field"><label for="risk_pause">风控阈值</label>
-        <input type="number" id="risk_pause" min="1" max="50" value="10"/>
+        <input type="number" id="risk_pause" min="1" max="50" value="10" title="仅持续编排：本批累计「注册风控」拒绝达到 N 次后暂停本批并分析拉黑 ASN"/>
       </div>
       <div class="control-actions">
         <button class="primary" id="btn-start" onclick="doStart()">启动任务</button>
@@ -2041,6 +2114,17 @@ HTML = r"""<!DOCTYPE html>
       </div>
     </div>
     <div class="msg" id="ctrl-msg" role="status" aria-live="polite"></div>
+  </section>
+
+  <section class="card panel" id="run-log-card">
+    <div class="section-head">
+      <h2>Run 滚动日志</h2>
+      <div class="button-group">
+        <button type="button" onclick="refreshRunLog(true)">刷新</button>
+        <span class="section-meta" id="run-log-meta"></span>
+      </div>
+    </div>
+    <div class="tail mono" id="run-log" style="max-height:360px;overflow:auto;white-space:pre-wrap"></div>
   </section>
 
   <section class="help-view" id="help-view" aria-labelledby="help-view-title" hidden>
@@ -2158,7 +2242,7 @@ HTML = r"""<!DOCTYPE html>
       <div class="proxy-view-heading">
         <div>
           <div class="page-title" id="proxy-view-title">外部代理池</div>
-          <p class="proxy-view-subtitle">凭据仅保存在本机，注册中途不会切换出口</p>
+          <p class="proxy-view-subtitle">凭据仅保存在本机；表格顺序就是运行与 Dry Run 的代理分配顺序</p>
         </div>
         <span class="proxy-job mono" id="proxy-updated">等待读取</span>
       </div>
@@ -2190,14 +2274,15 @@ HTML = r"""<!DOCTYPE html>
         <div class="proxy-list-head">
           <div>
             <h2>代理明细</h2>
+            <div class="proxy-job">使用“上移 / 下移”调整分配顺序，保存后下次分配立即生效</div>
             <div class="proxy-job mono" id="proxy-test-status" role="status" aria-live="polite">未开始检测</div>
           </div>
           <button id="proxy-test-all" onclick="testProxies()">检测全部</button>
         </div>
         <div class="proxy-table-wrap">
           <table class="proxy-table">
-            <thead><tr><th>状态</th><th>代理端点</th><th>出口 / ASN</th><th>延迟</th><th>最近状态</th><th>启用</th><th>操作</th></tr></thead>
-            <tbody id="proxy-body"><tr><td colspan="7" class="proxy-empty">正在读取代理池</td></tr></tbody>
+            <thead><tr><th>顺序</th><th>状态</th><th>代理端点</th><th>出口 / ASN</th><th>延迟</th><th>最近状态</th><th>启用</th><th>操作</th></tr></thead>
+            <tbody id="proxy-body"><tr><td colspan="8" class="proxy-empty">正在读取代理池</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -2234,9 +2319,53 @@ HTML = r"""<!DOCTYPE html>
         <div class="mail-provider-actions">
           <button class="primary" id="mail-provider-save" onclick="saveEmailProviderConfig()">保存配置</button>
           <button id="mail-provider-test" onclick="testEmailProviderConnection()">测试当前提供商</button>
+          <button id="outlook-inventory-check" onclick="checkOutlookInventory()" hidden>批量检测 Outlook 库存</button>
           <span class="mail-provider-meta mono" id="mail-provider-updated">尚未读取</span>
         </div>
+
         <div class="msg mail-provider-result" id="mail-provider-msg" role="status" aria-live="polite"></div>
+        <div class="msg" id="outlook-check-result" role="status" aria-live="polite"></div>
+        <div id="outlook-inventory-panel" class="outlook-inventory-panel" hidden>
+          <div class="section-head" style="margin-top:14px">
+            <h2 style="font-size:1rem;margin:0">Outlook 库存 / 使用记录</h2>
+            <div class="button-group">
+              <button type="button" onclick="loadOutlookInventory()">查看库存</button>
+              <button type="button" onclick="loadOutlookState()">查看使用记录</button>
+            </div>
+          </div>
+          <p class="domain-format mono" id="outlook-format-hint">格式：email----password----client_id----refresh_token（每行一条，提交覆盖库存）</p>
+          <div class="field">
+            <label for="outlook-inventory-input">库存内容（覆盖写入）</label>
+            <textarea id="outlook-inventory-input" rows="10" spellcheck="false" autocomplete="off" placeholder="email----password----client_id----refresh_token"></textarea>
+          </div>
+          <div class="button-group" style="margin-top:8px">
+            <button type="button" class="primary" id="outlook-inventory-save" onclick="saveOutlookInventory()">覆盖写入库存</button>
+            <span class="section-meta mono" id="outlook-inventory-meta"></span>
+          </div>
+          <div class="msg" id="outlook-inventory-msg" role="status" aria-live="polite"></div>
+          <div class="section-head" style="margin-top:16px">
+            <h2 style="font-size:1rem;margin:0">使用记录 outlook_state.json</h2>
+            <div class="button-group">
+              <button type="button" onclick="loadOutlookState()">查看使用记录</button>
+              <button type="button" onclick="downloadOutlookState()">下载 state</button>
+              <button type="button" onclick="document.getElementById('outlook-state-file').click()">选择上传文件</button>
+              <button type="button" class="primary" id="outlook-state-save" onclick="uploadOutlookState()">覆盖写入 state</button>
+              <span class="section-meta mono" id="outlook-state-meta"></span>
+            </div>
+          </div>
+          <input id="outlook-state-file" type="file" accept="application/json,.json" hidden onchange="onOutlookStateFilePicked(this)"/>
+          <div class="field" style="margin-top:8px">
+            <label for="outlook-state-input">state JSON（覆盖写入）</label>
+            <textarea id="outlook-state-input" rows="8" spellcheck="false" autocomplete="off" placeholder='{"version":1,"next_account_cursor":0,"allocation_serial":0,"accounts":{...}}'></textarea>
+          </div>
+          <div class="chips" id="outlook-state-kpis"></div>
+          <div class="table-scroll" style="max-height:280px;overflow:auto;margin-top:8px">
+            <table>
+              <thead><tr><th>邮箱</th><th>next</th><th>last_alias</th><th>disabled</th><th>last_at</th></tr></thead>
+              <tbody id="outlook-state-body"><tr><td colspan="5" class="domain-empty">点击「查看使用记录」</td></tr></tbody>
+            </table>
+          </div>
+        </div>
       </section>
 
       <details class="domain-advanced" id="domain-advanced">
@@ -2534,6 +2663,132 @@ HTML = r"""<!DOCTYPE html>
       </div>
     </div>
   </div>
+
+  <section class="card panel" id="integrations-card">
+    <div class="section-head">
+      <h2>推送 / 间隔 / 别名</h2>
+      <div class="button-group">
+        <button type="button" onclick="refreshIntegrations()">刷新</button>
+        <button type="button" class="primary" onclick="saveIntegrations()">保存</button>
+        <button type="button" onclick="testCpaConnectivity()">CPA连通</button>
+        <button type="button" onclick="testG2aConnectivity()">G2A连通</button>
+        <button type="button" onclick="runIntegrationsDryRun()">Dry Run</button>
+      </div>
+    </div>
+    <div class="msg" id="int-msg" role="status" aria-live="polite"></div>
+    <div class="form-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-top:10px">
+      <label>创建间隔 account_interval（秒）<br/><input id="int-account-interval" placeholder="例如 30 或 60-120（秒）"/></label>
+      <label>别名上限 / 账号<br/><input id="int-alias-cap" type="number" min="1" value="10"/></label>
+      <label>顺序 IP 游标<br/>
+        <select id="int-proxy-cursor"><option value="true">启用</option><option value="false">关闭</option></select>
+      </label>
+      <label>Outlook 别名池<br/>
+        <select id="int-alias-pool"><option value="true">启用</option><option value="false">关闭</option></select>
+      </label>
+      <label>CPA Remote URL<br/><input id="int-cpa-url" placeholder="https://cpa.example.com"/></label>
+      <label>CPA Grok Client Version<br/><input id="int-cpa-grok-version" placeholder="例如 1.0.4"/></label>
+      <label>CPA Management Key<br/><input id="int-cpa-key" type="password" placeholder="留空=不改；已配置会显示 *"/></label>
+      <label>Grok2API Base<br/><input id="int-g2a-base" placeholder="https://g2a.example.com"/></label>
+      <label>Grok2API 用户名<br/><input id="int-g2a-user"/></label>
+      <label>Grok2API 密码<br/><input id="int-g2a-pass" type="password" placeholder="留空=不改"/></label>
+      <label>Grok2API App Key<br/><input id="int-g2a-appkey" type="password" placeholder="可选；可当密码"/></label>
+    </div>
+    <div class="chips" id="int-secrets" style="margin-top:8px"></div>
+    <div class="section-head" style="margin-top:12px">
+      <h2 style="font-size:1rem;margin:0">Dry Run / 连通日志</h2>
+      <span class="section-meta mono" id="int-dry-meta"></span>
+    </div>
+    <div class="tail mono" id="int-dry-log" style="max-height:260px;overflow:auto;white-space:pre-wrap;margin-top:8px"></div>
+  </section>
+  <section class="card panel" id="auth-files-card">
+    <div class="section-head">
+      <h2>本地 Auth JSON</h2>
+      <div class="button-group">
+        <button type="button" class="primary" onclick="refreshAuthFiles('cpa')">刷新 CPA</button>
+        <button type="button" onclick="refreshAuthFiles('g2a')">刷新 G2A</button>
+        <button type="button" onclick="downloadAuthZip('cpa')">打包下载 CPA</button>
+        <button type="button" onclick="downloadAuthZip('g2a')">打包下载 G2A</button>
+      </div>
+    </div>
+    <div class="msg" id="auth-files-msg" role="status" aria-live="polite"></div>
+    <div class="chips" id="auth-files-kpis" style="margin-top:8px"></div>
+    <div class="section-meta mono" id="auth-files-meta" style="margin-top:6px"></div>
+    <div style="overflow:auto;max-height:360px;margin-top:10px">
+      <table class="data" id="auth-files-table">
+        <thead>
+          <tr>
+            <th>类型</th>
+            <th>文件名</th>
+            <th>邮箱</th>
+            <th>大小</th>
+            <th>mtime</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="auth-files-body">
+          <tr><td colspan="6" class="domain-empty">点刷新加载 cpa_auth / grok2api_auth</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+  <section class="card panel" id="registered-emails-card">
+    <div class="section-head">
+      <h2>已注册账号 registered_emails</h2>
+      <div class="button-group">
+        <button type="button" class="primary" onclick="refreshRegisteredEmails()">刷新</button>
+        <button type="button" onclick="downloadRegisteredEmails()">下载全部</button>
+        <button type="button" onclick="copyRegisteredEmails()">复制全部</button>
+        <button type="button" onclick="importRegisteredEmails()">录入/覆盖</button>
+        <button type="button" onclick="document.getElementById('reg-emails-file').click()">上传文件覆盖</button>
+        <input type="file" id="reg-emails-file" accept=".txt,text/plain" style="display:none" onchange="uploadRegisteredEmailsFile(event)" />
+      </div>
+    </div>
+    <div class="msg" id="reg-emails-msg" role="status" aria-live="polite"></div>
+    <div class="chips" id="reg-emails-kpis" style="margin-top:8px"></div>
+    <div class="section-meta mono" id="reg-emails-meta" style="margin-top:6px">格式: email----password----sso（SSO 可空）· 录入会整体覆盖 accounts/registered_emails.txt</div>
+    <textarea id="reg-emails-text" class="mono" rows="10" style="width:100%;margin-top:10px;white-space:pre;overflow:auto" placeholder="email----password----sso&#10;一行一个；SSO 可留空" spellcheck="false"></textarea>
+    <div style="overflow:auto;max-height:280px;margin-top:10px">
+      <table class="data" id="reg-emails-table">
+        <thead>
+          <tr>
+            <th>邮箱</th>
+            <th>SSO</th>
+            <th>来源</th>
+            <th>mtime</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="reg-emails-body">
+          <tr><td colspan="5" class="domain-empty">点刷新加载 registered_emails</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card panel" id="batch-relogin-card" aria-labelledby="relogin-title">
+    <div class="section-head">
+      <h2 id="relogin-title">批量重登</h2>
+      <span class="section-meta mono" id="relogin-status">空闲</span>
+    </div>
+    <p style="margin:0 0 10px;color:var(--muted);font-size:13px;line-height:1.5">
+      输入 xAI 账号（一行一个），从 registered_emails 查密码 → 浏览器重登拿 SSO → 写回 → 默认推 Grok2API Web/Console → 风控 → 成功则转 CPA 并推送。
+      勾选“仅推送CPA”时跳过 Grok2API Web/Console，保留风控和 CPA 配置写入。复用主程序代理游标与账号间隔。
+    </p>
+    <textarea id="relogin-emails" class="mono" rows="6" style="width:100%;white-space:pre" placeholder="one@email.com&#10;two@email.com" spellcheck="false"></textarea>
+    <label style="display:inline-flex;align-items:center;gap:6px;margin-top:10px">
+      <input id="relogin-only-cpa" type="checkbox"/>
+      仅推送CPA
+    </label>
+    <div class="button-group" style="margin-top:10px">
+      <button type="button" class="primary" id="relogin-start" onclick="startBatchRelogin()">开始重登</button>
+      <button type="button" class="danger" id="relogin-stop" onclick="stopBatchRelogin()" disabled>停止重登</button>
+      <button type="button" onclick="refreshBatchRelogin()">刷新状态</button>
+    </div>
+    <div class="msg" id="relogin-msg" role="status" aria-live="polite"></div>
+    <div class="chips" id="relogin-kpis" style="margin-top:8px"></div>
+    <pre class="mono" id="relogin-report" style="margin-top:10px;max-height:220px;overflow:auto;white-space:pre-wrap"></pre>
+  </section>
+
   <section class="card panel">
     <div class="section-head"><h2>日志尾部</h2></div>
     <div class="tail mono" id="tail"></div>
@@ -2543,6 +2798,7 @@ HTML = r"""<!DOCTYPE html>
 <script>
 let last = null;
 let proxyData = null;
+let proxyOrderSaving = false;
 let domainData = null;
 let emailProviderData = null;
 let selectedEmailProvider = "";
@@ -2836,7 +3092,7 @@ function renderProxyPool(data) {
     : (job.finished_at ? ("上次检测：健康 " + (job.healthy || 0) + "，失败 " + (job.failed || 0)) : "未开始检测");
 
   const items = proxyData.items || [];
-  document.getElementById("proxy-body").innerHTML = items.length ? items.map(item => {
+  document.getElementById("proxy-body").innerHTML = items.length ? items.map((item, index) => {
     const status = item.status || "unknown";
     const stateClass = ["healthy", "unhealthy", "cooldown", "testing"].includes(status) ? status : "";
     const exit = item.exit_ip ? esc(item.exit_ip) : "--";
@@ -2847,6 +3103,7 @@ function renderProxyPool(data) {
     const detail = cooldown || item.last_error || (item.last_checked_at ? ("检测 " + proxyTime(item.last_checked_at)) : "尚未检测");
     const count = (item.failure_count || 0) > 0 ? `<div class="proxy-meta">失败 ${esc(item.failure_count)} / 风控 ${esc(item.risk_count || 0)}</div>` : "";
     return `<tr>
+      <td><div class="proxy-order"><span class="proxy-order-index">${index + 1}</span><div class="proxy-order-actions"><button ${index === 0 ? "disabled" : ""} onclick="moveProxyItem('${item.id}', -1)" aria-label="上移代理">上移</button><button ${index === items.length - 1 ? "disabled" : ""} onclick="moveProxyItem('${item.id}', 1)" aria-label="下移代理">下移</button></div></div></td>
       <td><span class="proxy-state ${stateClass}">${esc(proxyStatusLabel(status))}</span></td>
       <td><div class="mono proxy-endpoint">${esc(item.display_url || "")}</div><div class="proxy-meta">${item.has_auth ? "凭据已隐藏" : "无鉴权"} / ${esc(item.source || "panel")}</div></td>
       <td><div class="mono">${exit}</div><div class="proxy-meta mono">${asn}</div>${org}</td>
@@ -2855,7 +3112,7 @@ function renderProxyPool(data) {
       <td><input class="proxy-toggle" type="checkbox" aria-label="启用 ${esc(item.display_url || "代理")}" ${item.enabled ? "checked" : ""} onchange="setProxyEnabled('${item.id}', this.checked)"/></td>
       <td><div class="proxy-actions"><button ${status === "testing" ? "disabled" : ""} onclick="testProxies('${item.id}')">检测</button><button class="danger" onclick="deleteProxyItem('${item.id}')">删除</button></div></td>
     </tr>`;
-  }).join("") : '<tr><td colspan="7" class="proxy-empty">代理池为空，可在上方导入单条或批量代理</td></tr>';
+  }).join("") : '<tr><td colspan="8" class="proxy-empty">代理池为空，可在上方导入单条或批量代理</td></tr>';
 }
 async function refreshProxies(authHelp = false) {
   try {
@@ -2927,6 +3184,29 @@ async function setProxyEnabled(id, enabled) {
     await refreshProxies(false);
   }
 }
+async function moveProxyItem(id, direction) {
+  if (proxyOrderSaving) return;
+  const items = proxyData.items.slice();
+  const index = items.findIndex(item => item.id === id);
+  const targetIndex = index + direction;
+  if (index < 0 || targetIndex < 0 || targetIndex >= items.length) return;
+  const ids = items.map(item => item.id);
+  [ids[index], ids[targetIndex]] = [ids[targetIndex], ids[index]];
+  proxyOrderSaving = true;
+  try {
+    const result = await api("/api/proxies/reorder", {
+      method: "POST",
+      body: JSON.stringify({ ids }),
+    });
+    renderProxyPool(result);
+    setMsg("proxy-msg", "代理顺序已保存", "ok");
+  } catch (e) {
+    setMsg("proxy-msg", String(e.message || e), "err");
+    await refreshProxies(false);
+  } finally {
+    proxyOrderSaving = false;
+  }
+}
 async function deleteProxyItem(id) {
   const item = (proxyData && proxyData.items || []).find(value => value.id === id);
   if (!confirm("删除代理 " + (item ? item.display_url : "") + "？")) return;
@@ -2961,6 +3241,439 @@ function emailProviderFieldControl(field) {
   const note = configured ? "已保存密钥" : "尚未配置";
   return `<div class="mail-secret-wrap" data-mail-secret-wrap="${esc(field.name)}">${input}${clear}</div><div class="mail-secret-note" data-mail-secret-note="${esc(field.name)}">${note}</div>`;
 }
+
+function syncOutlookInventoryPanel(provider) {
+  const panel = document.getElementById("outlook-inventory-panel");
+  const check = document.getElementById("outlook-inventory-check");
+  if (!panel || !check) return;
+  const show = provider === "outlook_rt";
+  panel.hidden = !show;
+  check.hidden = !show;
+}
+async function loadOutlookInventory() {
+  try {
+    const j = await api("/api/email-provider/outlook-inventory?mask=0&_=" + Date.now());
+    const ta = document.getElementById("outlook-inventory-input");
+    if (ta) ta.value = j.text || "";
+    const meta = document.getElementById("outlook-inventory-meta");
+    if (meta) meta.textContent = (j.path || "") + " · " + (j.total_lines || 0) + " 条";
+    setMsg("outlook-inventory-msg", "已加载库存 " + (j.total_lines || 0) + " 条", "ok");
+  } catch (e) {
+    setMsg("outlook-inventory-msg", String(e.message || e), "err");
+  }
+}
+async function saveOutlookInventory() {
+  const btn = document.getElementById("outlook-inventory-save");
+  if (btn) btn.disabled = true;
+  setMsg("outlook-inventory-msg", "正在覆盖写入…", "");
+  try {
+    const text = (document.getElementById("outlook-inventory-input") || {}).value || "";
+    if (!String(text).trim()) throw new Error("库存内容为空");
+    if (!confirm("确认覆盖库存文件？此操作不可撤销。")) {
+      setMsg("outlook-inventory-msg", "已取消", "");
+      if (btn) btn.disabled = false;
+      return;
+    }
+    const j = await api("/api/email-provider/outlook-inventory", {
+      method: "POST",
+      body: JSON.stringify({ text }),
+    });
+    const meta = document.getElementById("outlook-inventory-meta");
+    if (meta) meta.textContent = (j.path || "") + " · " + (j.written || j.total_lines || 0) + " 条";
+    setMsg("outlook-inventory-msg", "已覆盖写入 " + (j.written || j.total_lines || 0) + " 条", "ok");
+    await refreshEmailProvider(false);
+  } catch (e) {
+    setMsg("outlook-inventory-msg", String(e.message || e), "err");
+  }
+  if (btn) btn.disabled = false;
+}
+
+let registeredEmailsText = "";
+let registeredEmailsRows = [];
+
+function formatRegMtime(ts){
+  if(!ts) return "";
+  try { return new Date(Number(ts)*1000).toLocaleString(); } catch(e){ return String(ts); }
+}
+async function refreshRegisteredEmails(){
+  setMsg("reg-emails-msg", "加载已注册账号…", "");
+  try{
+    const j = await api("/api/registered-emails?limit=20000&_=" + Date.now());
+    registeredEmailsText = j.export_text || "";
+    registeredEmailsRows = j.accounts || [];
+    const ta = document.getElementById("reg-emails-text");
+    if(ta) ta.value = registeredEmailsText;
+    const meta = document.getElementById("reg-emails-meta");
+    if(meta) meta.textContent = (j.format || "email----password----sso") + " · " + (j.count||0) + " 个 · 有SSO " + (j.with_sso||0) + " · 无SSO " + (j.without_sso||0);
+    const kpis = document.getElementById("reg-emails-kpis");
+    if(kpis){
+      const items = [
+        ["数量", j.count ?? 0],
+        ["有SSO", j.with_sso ?? 0],
+        ["无SSO", j.without_sso ?? 0],
+        ["文件", j.path || "accounts/registered_emails.txt"],
+      ];
+      kpis.innerHTML = items.map(([k,v]) => `<span class="chip">${esc(k)}: ${esc(v)}</span>`).join(" ");
+    }
+    const body = document.getElementById("reg-emails-body");
+    if(body){
+      const rows = registeredEmailsRows;
+      if(!rows.length){
+        body.innerHTML = '<tr><td colspan="5" class="domain-empty">暂无已注册账号</td></tr>';
+      } else {
+        body.innerHTML = rows.map(r => {
+          const em = r.email || "";
+          const q = encodeURIComponent(em);
+          const ssoMark = r.has_sso ? "有" : "空";
+          return `<tr>
+            <td class="mono">${esc(em)}</td>
+            <td class="mono">${esc(ssoMark)}</td>
+            <td class="mono">${esc(r.source||"")}</td>
+            <td class="mono">${esc(formatRegMtime(r.mtime))}</td>
+            <td><button type="button" data-email="${q}" onclick="downloadOneRegistered(decodeURIComponent(this.dataset.email))">下载</button></td>
+          </tr>`;
+        }).join("");
+      }
+    }
+    setMsg("reg-emails-msg", "已加载 " + (j.count||0) + " 个 registered_emails", "ok");
+  }catch(e){ setMsg("reg-emails-msg", String(e.message||e), "err"); }
+}
+async function importRegisteredEmails(){
+  const ta = document.getElementById("reg-emails-text");
+  const text = ta ? ta.value : "";
+  if(!String(text||"").trim()){
+    setMsg("reg-emails-msg", "文本框为空，请粘贴 email----password----sso", "err");
+    return;
+  }
+  if(!confirm("将用文本框内容【整体覆盖】accounts/registered_emails.txt，确认？")) return;
+  setMsg("reg-emails-msg", "正在覆盖写入…", "");
+  try{
+    const j = await api("/api/registered-emails/import", {
+      method: "POST",
+      body: JSON.stringify({ text }),
+    });
+    setMsg("reg-emails-msg", "已覆盖 " + (j.count||0) + " 行（有SSO " + (j.with_sso||0) + "）", "ok");
+    await refreshRegisteredEmails();
+  }catch(e){ setMsg("reg-emails-msg", String(e.message||e), "err"); }
+}
+async function uploadRegisteredEmailsFile(ev){
+  try{
+    const file = ev && ev.target && ev.target.files && ev.target.files[0];
+    if(!file) return;
+    const text = await file.text();
+    if(!String(text||"").trim()){
+      setMsg("reg-emails-msg", "文件为空", "err");
+      return;
+    }
+    if(!confirm("上传文件将【整体覆盖】registered_emails.txt，确认？\n" + file.name)) return;
+    setMsg("reg-emails-msg", "正在上传覆盖…", "");
+    const j = await api("/api/registered-emails/import", {
+      method: "POST",
+      body: JSON.stringify({ text }),
+    });
+    setMsg("reg-emails-msg", "已覆盖 " + (j.count||0) + " 行", "ok");
+    if(ev && ev.target) ev.target.value = "";
+    await refreshRegisteredEmails();
+  }catch(e){ setMsg("reg-emails-msg", String(e.message||e), "err"); }
+}
+async function downloadRegisteredEmails(){
+  try{
+    const j = await api("/api/registered-emails/export?_=" + Date.now());
+    downloadTextFile(j.filename || "registered_emails.txt", j.text || "");
+    setMsg("reg-emails-msg", "已下载 " + (j.count||0) + " 行", "ok");
+  }catch(e){ setMsg("reg-emails-msg", String(e.message||e), "err"); }
+}
+async function downloadOneRegistered(email){
+  try{
+    const j = await api("/api/registered-emails/one?email=" + encodeURIComponent(email) + "&_=" + Date.now());
+    const name = (j.email || email || "account").replace(/[\\/]/g,"_") + ".txt";
+    downloadTextFile(name, (j.line || "") + "\n");
+    setMsg("reg-emails-msg", "已下载 " + (j.email || email), "ok");
+  }catch(e){ setMsg("reg-emails-msg", String(e.message||e), "err"); }
+}
+async function copyRegisteredEmails(){
+  try{
+    let text = registeredEmailsText;
+    if(!text){
+      const j = await api("/api/registered-emails/export?_=" + Date.now());
+      text = j.text || "";
+      registeredEmailsText = text;
+      const ta = document.getElementById("reg-emails-text");
+      if(ta) ta.value = text;
+    }
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      await navigator.clipboard.writeText(text);
+    } else {
+      const ta = document.getElementById("reg-emails-text");
+      if(ta){ ta.focus(); ta.select(); document.execCommand("copy"); }
+    }
+    setMsg("reg-emails-msg", "已复制到剪贴板", "ok");
+  }catch(e){ setMsg("reg-emails-msg", String(e.message||e), "err"); }
+}
+
+function renderReloginStatus(data){
+  const st = document.getElementById("relogin-status");
+  if(st) st.textContent = data.running ? ("重登中 #" + (data.pid || "?")) : "空闲";
+  const startBtn = document.getElementById("relogin-start");
+  const stopBtn = document.getElementById("relogin-stop");
+  const onlyCpa = document.getElementById("relogin-only-cpa");
+  if(startBtn) startBtn.disabled = !!data.running;
+  if(stopBtn) stopBtn.disabled = !data.running;
+  if(onlyCpa) onlyCpa.disabled = !!data.running;
+  const rep = data.last_report || {};
+  const kpis = document.getElementById("relogin-kpis");
+  if(kpis){
+    const items = [
+      ["输入", rep.input_count ?? 0],
+      ["成功", rep.success_count ?? 0],
+      ["失败", rep.fail_count ?? 0],
+      ["跳过", rep.skipped_count ?? 0],
+    ];
+    kpis.innerHTML = items.map(([k,v]) => `<span class="chip">${esc(k)}: ${esc(v)}</span>`).join(" ");
+  }
+  const pre = document.getElementById("relogin-report");
+  if(pre){
+    const lines = [];
+    if(rep.started_at) lines.push("started: " + rep.started_at);
+    if(rep.finished_at) lines.push("finished: " + rep.finished_at);
+    if(rep.cancelled) lines.push("cancelled: true");
+    if(rep.only_cpa) lines.push("mode: 仅推送CPA");
+    if(rep.error) lines.push("error: " + rep.error);
+    for(const it of (rep.items || [])){
+      lines.push((it.ok ? "[+]" : "[-]") + " " + (it.email || "") + " · " + (it.reason || ""));
+    }
+    pre.textContent = lines.join("\n") || "暂无报告";
+  }
+}
+async function refreshBatchRelogin(){
+  try{
+    const data = await api("/api/batch-relogin?_=" + Date.now(), { authHelp: false });
+    renderReloginStatus(data || {});
+  }catch(e){
+    const st = document.getElementById("relogin-status");
+    if(st) st.textContent = "检查失败";
+  }
+}
+async function startBatchRelogin(){
+  const ta = document.getElementById("relogin-emails");
+  const text = ta ? ta.value : "";
+  const onlyCpaEl = document.getElementById("relogin-only-cpa");
+  const onlyCpa = !!(onlyCpaEl && onlyCpaEl.checked);
+  if(!String(text||"").trim()){
+    setMsg("relogin-msg", "请输入至少一个邮箱", "err");
+    return;
+  }
+  if(!confirm("开始批量重登？" + (onlyCpa ? "本次仅推送CPA，将跳过 Grok2API Web/Console。" : "将按账号间隔依次浏览器登录并推送 Grok2API/CPA。"))) return;
+  setMsg("relogin-msg", "正在启动…", "");
+  try{
+    const data = await api("/api/batch-relogin/start", {
+      method: "POST",
+      body: JSON.stringify({ text, only_cpa: onlyCpa }),
+    });
+    const runHint = data.run_log ? (" · run_log=" + data.run_log) : "";
+    setMsg("relogin-msg", "已启动，共 " + (data.input_count || 0) + " 个 · log=" + (data.log || "") + runHint, "ok");
+    await refreshBatchRelogin();
+    await refreshRunLog(true);
+  }catch(e){ setMsg("relogin-msg", String(e.message||e), "err"); }
+}
+async function stopBatchRelogin(){
+  try{
+    const data = await api("/api/batch-relogin/stop", { method: "POST", body: "{}" });
+    setMsg("relogin-msg", "已请求停止 " + JSON.stringify(data.killed || []), "ok");
+    await refreshBatchRelogin();
+    await refreshRunLog(true);
+  }catch(e){ setMsg("relogin-msg", String(e.message||e), "err"); }
+}
+
+let authFilesCache = {cpa: [], g2a: []};
+let authFilesKind = "cpa";
+
+function formatBytes(n){
+  n = Number(n||0);
+  if(n < 1024) return n + " B";
+  if(n < 1048576) return (n/1024).toFixed(1) + " KB";
+  return (n/1048576).toFixed(2) + " MB";
+}
+function formatMtime(ts){
+  if(!ts) return "";
+  try { return new Date(Number(ts)*1000).toLocaleString(); } catch(e){ return String(ts); }
+}
+function renderAuthFiles(kind, j){
+  authFilesKind = kind || "cpa";
+  const files = j.files || [];
+  authFilesCache[authFilesKind] = files;
+  const meta = document.getElementById("auth-files-meta");
+  if(meta) meta.textContent = (j.path || "") + " · " + (j.count ?? files.length) + " 个" + (j.truncated ? "（已截断）" : "");
+  const kpis = document.getElementById("auth-files-kpis");
+  if(kpis){
+    const items = [
+      ["当前", authFilesKind.toUpperCase()],
+      ["数量", j.count ?? files.length],
+      ["目录", j.path || "-"],
+    ];
+    kpis.innerHTML = items.map(([k,v]) => `<span class="chip">${esc(k)}: ${esc(v)}</span>`).join(" ");
+  }
+  const body = document.getElementById("auth-files-body");
+  if(!body) return;
+  if(!files.length){
+    body.innerHTML = '<tr><td colspan="6" class="domain-empty">目录为空或不存在</td></tr>';
+    return;
+  }
+  body.innerHTML = files.map(f => {
+    const name = f.name || "";
+    const dis = f.disabled === true ? ' <span class="chip">disabled</span>' : '';
+    const qk = encodeURIComponent(authFilesKind);
+    const qn = encodeURIComponent(name);
+    return `<tr>
+      <td>${esc(authFilesKind.toUpperCase())}</td>
+      <td class="mono">${esc(name)}${dis}</td>
+      <td class="mono">${esc(f.email||"")}</td>
+      <td>${esc(formatBytes(f.bytes))}</td>
+      <td class="mono">${esc(formatMtime(f.mtime))}</td>
+      <td><button type="button" data-kind="${qk}" data-name="${qn}" onclick="downloadAuthFile(decodeURIComponent(this.dataset.kind), decodeURIComponent(this.dataset.name))">下载</button></td>
+    </tr>`;
+  }).join("");
+}
+async function refreshAuthFiles(kind){
+  const k = kind || authFilesKind || "cpa";
+  setMsg("auth-files-msg", "加载 " + k + " …", "");
+  try{
+    const j = await api("/api/auth-files?kind=" + encodeURIComponent(k) + "&limit=5000&_=" + Date.now());
+    renderAuthFiles(k, j);
+    setMsg("auth-files-msg", "已加载 " + k.toUpperCase() + " " + (j.count ?? 0) + " 个", "ok");
+  }catch(e){ setMsg("auth-files-msg", String(e.message||e), "err"); }
+}
+async function downloadAuthFile(kind, name){
+  try{
+    const j = await api("/api/auth-files/raw?kind=" + encodeURIComponent(kind) + "&name=" + encodeURIComponent(name) + "&_=" + Date.now());
+    downloadTextFile(j.filename || name, j.text || "");
+    setMsg("auth-files-msg", "已下载 " + (j.filename || name), "ok");
+  }catch(e){ setMsg("auth-files-msg", String(e.message||e), "err"); }
+}
+function downloadBase64File(filename, b64, mime){
+  const bin = atob(b64 || "");
+  const bytes = new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++) bytes[i] = bin.charCodeAt(i);
+  const blob = new Blob([bytes], {type: mime || "application/zip"});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename || "auth.zip";
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+async function downloadAuthZip(kind){
+  const k = kind || authFilesKind || "cpa";
+  setMsg("auth-files-msg", "打包 " + k + " …", "");
+  try{
+    const j = await api("/api/auth-files/zip?kind=" + encodeURIComponent(k) + "&_=" + Date.now());
+    downloadBase64File(j.filename || (k + "_auth.zip"), j.content_b64 || "", "application/zip");
+    setMsg("auth-files-msg", "已打包下载 " + (j.count||0) + " 个 " + k.toUpperCase(), "ok");
+  }catch(e){ setMsg("auth-files-msg", String(e.message||e), "err"); }
+}
+
+function downloadTextFile(filename, text){
+  const blob = new Blob([text || ""], {type: "application/json;charset=utf-8"});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename || "outlook_state.json";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+async function downloadOutlookState(){
+  try{
+    const j = await api("/api/email-provider/outlook-state/raw?_=" + Date.now());
+    const ta = document.getElementById("outlook-state-input");
+    if(ta) ta.value = j.text || "";
+    downloadTextFile(j.filename || "outlook_state.json", j.text || "");
+    const meta = document.getElementById("outlook-state-meta");
+    if(meta) meta.textContent = (j.path || "outlook_state.json") + " · " + (j.bytes || 0) + " B";
+    setMsg("outlook-inventory-msg", "已下载 " + (j.filename || "outlook_state.json"), "ok");
+  }catch(e){ setMsg("outlook-inventory-msg", String(e.message||e), "err"); }
+}
+function onOutlookStateFilePicked(input){
+  const file = input && input.files && input.files[0];
+  if(!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    const ta = document.getElementById("outlook-state-input");
+    if(ta) ta.value = String(reader.result || "");
+    setMsg("outlook-inventory-msg", "已载入文件 " + file.name + "，确认后点覆盖写入", "ok");
+  };
+  reader.onerror = () => setMsg("outlook-inventory-msg", "读取文件失败", "err");
+  reader.readAsText(file, "utf-8");
+  input.value = "";
+}
+async function uploadOutlookState(){
+  const btn = document.getElementById("outlook-state-save");
+  if(btn) btn.disabled = true;
+  setMsg("outlook-inventory-msg", "正在覆盖写入 outlook_state.json…", "");
+  try{
+    const text = (document.getElementById("outlook-state-input") || {}).value || "";
+    if(!String(text).trim()) throw new Error("state JSON 为空");
+    JSON.parse(String(text)); // client-side sanity
+    if(!confirm("确认覆盖 outlook_state.json？此操作不可撤销。")){
+      setMsg("outlook-inventory-msg", "已取消", "");
+      if(btn) btn.disabled = false;
+      return;
+    }
+    const j = await api("/api/email-provider/outlook-state", {
+      method: "POST",
+      body: JSON.stringify({ text }),
+    });
+    setMsg("outlook-inventory-msg", "已覆盖写入 state · " + (j.written_accounts ?? j.total_accounts ?? 0) + " 账号", "ok");
+    await loadOutlookState();
+  }catch(e){ setMsg("outlook-inventory-msg", String(e.message||e), "err"); }
+  if(btn) btn.disabled = false;
+}
+
+async function loadOutlookState() {
+  try {
+    const j = await api("/api/email-provider/outlook-state?limit=800&_=" + Date.now());
+    const meta = document.getElementById("outlook-state-meta");
+    if (meta) meta.textContent = (j.path || "outlook_state.json") + (j.exists ? "" : "（尚无文件）");
+    const kpis = document.getElementById("outlook-state-kpis");
+    if (kpis) {
+      const items = [
+        ["库存主号", j.inventory_account_count ?? j.account_count ?? 0],
+        ["state已见", j.state_account_count ?? 0],
+        ["库存未用", j.inventory_only_count ?? 0],
+        ["state孤儿", j.state_only_count ?? 0],
+        ["已用别名位", j.used_alias_slots ?? 0],
+        ["剩余可分配", j.remaining_alias_slots ?? j.remaining_alias_slots_est ?? 0],
+        ["禁用", j.disabled_count ?? 0],
+        ["cursor", j.next_account_cursor ?? 0],
+        ["serial", j.allocation_serial ?? 0],
+      ];
+      kpis.innerHTML = items.map(([k,v]) => `<span class="chip">${esc(k)}: ${esc(v)}</span>`).join(" ");
+    }
+    const body = document.getElementById("outlook-state-body");
+    const rows = j.accounts || [];
+    if (body) {
+      if (!rows.length) {
+        body.innerHTML = '<tr><td colspan="5" class="domain-empty">暂无使用记录</td></tr>';
+      } else {
+        body.innerHTML = rows.map(r => `<tr>
+          <td class="mono">${esc(r.email||"")}${r.in_inventory===false?" <span class=\"chip\">非库存</span>":(r.in_state===false?" <span class=\"chip\">未用过</span>":"")}</td>
+          <td>${esc(r.next_alias_index??0)}</td>
+          <td class="mono">${esc(r.last_alias||"")}</td>
+          <td>${r.disabled ? "是" : ""}</td>
+          <td class="mono">${esc(r.last_allocated_at||"")}</td>
+        </tr>`).join("");
+      }
+    }
+    setMsg("outlook-inventory-msg",
+      "池口径：主号 " + (j.inventory_account_count ?? j.account_count ?? 0)
+      + " · 剩余 " + (j.remaining_alias_slots ?? j.remaining_alias_slots_est ?? 0)
+      + "（与 Dry Run 一致）",
+      "ok");
+  } catch (e) {
+    setMsg("outlook-inventory-msg", String(e.message || e), "err");
+  }
+}
+
 function renderEmailProviderFields(provider) {
   const definition = currentEmailProviderDefinition(provider);
   if (!definition) return;
@@ -2979,6 +3692,7 @@ function renderEmailProviderFields(provider) {
   document.getElementById("mail-provider-fields").innerHTML = (definition.fields || []).map(field =>
     `<div class="field"><label for="mail-field-${esc(field.name)}">${esc(field.label)}</label>${emailProviderFieldControl(field)}</div>`
   ).join("") || '<div class="field"><label>服务配置</label><input disabled value="该服务商没有可编辑字段"/></div>';
+  syncOutlookInventoryPanel(definition.id);
   const domainProvider = document.getElementById("domain-provider");
   if (domainProvider && ["cloudflare", "cloudmail", "moemail", "yyds"].includes(definition.id)) {
     domainProvider.value = definition.id;
@@ -3078,6 +3792,24 @@ async function testEmailProviderConnection() {
     }) });
     setMsg("mail-provider-msg", result.detail || "连接正常", "ok");
   } catch (e) { setMsg("mail-provider-msg", String(e.message || e), "err"); }
+  button.disabled = false;
+}
+async function checkOutlookInventory() {
+  const button = document.getElementById("outlook-inventory-check");
+  button.disabled = true;
+  setMsg("outlook-check-result", "正在逐个检测 RT 和 Inbox…", "");
+  try {
+    const result = await api("/api/email-provider/outlook-inventory-check", { method: "POST", body: JSON.stringify({
+      settings: collectEmailProviderSettings(),
+    }) });
+    const rows = result.results || [];
+    const ok = rows.filter(row => row.refresh === "ok" && row.graph === "ok").length;
+    const html = `<div>完成：${ok}/${rows.length} 个账号可正常刷新并查询 Inbox</div>` +
+      `<table class="proxy-table"><thead><tr><th>邮箱</th><th>RT</th><th>Graph</th><th>Inbox</th><th>错误</th></tr></thead><tbody>` +
+      rows.map(row => `<tr><td>${esc(row.email)}</td><td>${esc(row.refresh)}</td><td>${esc(row.graph)}</td><td>${esc(row.inbox)}</td><td>${esc(row.error)}</td></tr>`).join("") +
+      `</tbody></table>`;
+    document.getElementById("outlook-check-result").innerHTML = html;
+  } catch (e) { setMsg("outlook-check-result", String(e.message || e), "err"); }
   button.disabled = false;
 }
 function domainStatusLabel(status) {
@@ -3201,6 +3933,141 @@ async function deleteEmailDomain(id) {
     setMsg("domain-msg", "域名已删除", "ok");
   } catch (e) { setMsg("domain-msg", String(e.message || e), "err"); }
 }
+
+async function refreshIntegrations(authHelp=false){
+  try{
+    const j = await api("/api/integrations?_="+Date.now(), {authHelp});
+    const c = (j && j.config) || {};
+    const set = (id,v)=>{ const el=document.getElementById(id); if(el && document.activeElement!==el) el.value = (v==null?"":String(v)); };
+    set("int-account-interval", c.account_interval||"");
+    set("int-alias-cap", c.outlook_aliases_per_account||10);
+    set("int-proxy-cursor", c.proxy_cursor_enabled===false?"false":"true");
+    set("int-alias-pool", c.outlook_use_alias_pool===false?"false":"true");
+    set("int-cpa-url", c.cpa_remote_url||"");
+    set("int-cpa-grok-version", c.cpa_grok_version||"1.0.4");
+    set("int-g2a-base", c.grok2api_remote_base||"");
+    set("int-g2a-user", c.grok2api_remote_username||"");
+    // secrets: leave blank, show chips
+    const sc = c.secret_configured||{};
+    const chips = document.getElementById("int-secrets");
+    if(chips){
+      chips.innerHTML = ["cpa_management_key","grok2api_remote_password","grok2api_remote_app_key"].map(k=>{
+        const ok = !!(sc[k]);
+        return `<span class="chip ${ok?"ok":""}">${k}: ${ok?"已配置":"未配置"}</span>`;
+      }).join(" ");
+    }
+  }catch(e){ setMsg("int-msg", String(e.message||e), "err"); }
+}
+async function saveIntegrations(){
+  try{
+    const settings = collectIntegrationSettings();
+    const j = await api("/api/integrations", {method:"POST", body: JSON.stringify({settings})});
+    if(j.ok===false) throw new Error(j.error||"save failed");
+    document.getElementById("int-cpa-key").value = "";
+    document.getElementById("int-g2a-pass").value = "";
+    document.getElementById("int-g2a-appkey").value = "";
+    setMsg("int-msg", "已保存推送/间隔/别名配置", "ok");
+    await refreshIntegrations();
+  }catch(e){ setMsg("int-msg", String(e.message||e), "err"); }
+}
+
+function collectIntegrationSettings(){
+  return {
+    account_interval: document.getElementById("int-account-interval").value,
+    outlook_aliases_per_account: Number(document.getElementById("int-alias-cap").value||10),
+    proxy_cursor_enabled: document.getElementById("int-proxy-cursor").value === "true",
+    outlook_use_alias_pool: document.getElementById("int-alias-pool").value === "true",
+    cpa_remote_url: document.getElementById("int-cpa-url").value,
+    cpa_grok_version: document.getElementById("int-cpa-grok-version").value,
+    grok2api_remote_base: document.getElementById("int-g2a-base").value,
+    grok2api_remote_username: document.getElementById("int-g2a-user").value,
+    cpa_management_key: document.getElementById("int-cpa-key").value,
+    grok2api_remote_password: document.getElementById("int-g2a-pass").value,
+    grok2api_remote_app_key: document.getElementById("int-g2a-appkey").value,
+    cpa_auto_add: true,
+    grok2api_auto_add_remote: true,
+  };
+}
+function showDryLines(lines, meta){
+  const box = document.getElementById("int-dry-log");
+  const m = document.getElementById("int-dry-meta");
+  if(m) m.textContent = meta || "";
+  if(box){
+    box.textContent = (lines||[]).join("\n");
+    box.scrollTop = box.scrollHeight;
+  }
+}
+async function testCpaConnectivity(){
+  setMsg("int-msg", "正在测 CPA 连通…", "");
+  try{
+    const settings = collectIntegrationSettings();
+    const j = await api("/api/integrations/test-cpa", {method:"POST", body: JSON.stringify({settings})});
+    if(j.ok){
+      setMsg("int-msg", j.detail || "CPA 连通 OK", "ok");
+      showDryLines([`[CPA] ${j.detail||"OK"}`], "CPA");
+    }else{
+      setMsg("int-msg", j.error || "CPA 不通", "err");
+      showDryLines([`[CPA] FAIL ${j.error||""}`], "CPA");
+    }
+  }catch(e){ setMsg("int-msg", String(e.message||e), "err"); }
+}
+async function testG2aConnectivity(){
+  setMsg("int-msg", "正在测 Grok2API 连通…", "");
+  try{
+    const settings = collectIntegrationSettings();
+    const j = await api("/api/integrations/test-g2a", {method:"POST", body: JSON.stringify({settings})});
+    if(j.ok){
+      setMsg("int-msg", j.detail || "Grok2API 连通 OK", "ok");
+      showDryLines([`[G2A] ${j.detail||"OK"}`], "G2A");
+    }else{
+      setMsg("int-msg", j.error || "Grok2API 不通", "err");
+      showDryLines([`[G2A] FAIL ${j.error||""}`], "G2A");
+    }
+  }catch(e){ setMsg("int-msg", String(e.message||e), "err"); }
+}
+async function runIntegrationsDryRun(){
+  setMsg("int-msg", "正在 Dry Run…", "");
+  showDryLines(["正在执行 Dry Run…"], "");
+  try{
+    // save current form first so dry uses same params
+    await saveIntegrations();
+    const workers = Number((document.getElementById("workers-input")||{}).value || 1);
+    const batch_count = Number((document.getElementById("batch_count")||{}).value || 1);
+    const j = await api("/api/integrations/dry-run", {
+      method:"POST",
+      body: JSON.stringify({ workers, target_count: batch_count, settings: collectIntegrationSettings() }),
+    });
+    showDryLines(j.lines || [], j.path || "dry-run");
+    if(j.ok){
+      setMsg("int-msg", "Dry Run 完成 · " + (j.path||""), "ok");
+      await refreshRunLog(true);
+    }else{
+      setMsg("int-msg", j.error || "Dry Run 失败", "err");
+    }
+  }catch(e){ setMsg("int-msg", String(e.message||e), "err"); }
+}
+
+async function refreshRunLog(forceBottom){
+  try{
+    const j = await api("/api/run-log?lines=400&_="+Date.now(), {authHelp:false});
+    const box = document.getElementById("run-log");
+    const meta = document.getElementById("run-log-meta");
+    if(meta) meta.textContent = j.path || (j.missing?"暂无 run 日志":"");
+    if(box){
+      const nearBottom = (box.scrollHeight - box.scrollTop - box.clientHeight) < 48;
+      const lines = j.lines || [];
+      const text = lines.join("\n");
+      if(box.textContent !== text){
+        box.textContent = text;
+        if(forceBottom || nearBottom) box.scrollTop = box.scrollHeight;
+      }
+    }
+  }catch(e){
+    const box=document.getElementById("run-log");
+    if(box) box.textContent = String(e.message||e);
+  }
+}
+
 async function refresh() {
   try {
     const d = await api("/api/status?_=" + Date.now(), { authHelp: false });
@@ -3225,6 +4092,26 @@ function fillControl(d) {
   if (c.add_count != null && document.getElementById("add_count")) document.getElementById("add_count").value = c.add_count;
   if (c.risk_pause != null) document.getElementById("risk_pause").value = c.risk_pause;
   if (c.mode) document.getElementById("mode").value = c.mode;
+  syncModeFields();
+}
+function syncModeFields() {
+  const modeEl = document.getElementById("mode");
+  const mode = modeEl ? modeEl.value : "orch";
+  const batchOnly = mode === "batch";
+  const addEl = document.getElementById("add_count");
+  const riskEl = document.getElementById("risk_pause");
+  if (addEl) {
+    addEl.disabled = batchOnly;
+    addEl.title = batchOnly
+      ? "单批运行不用此参数；目标看「单批数量」"
+      : "仅持续编排：从当前 CPA 数再追加 N 个成功目标";
+  }
+  if (riskEl) {
+    riskEl.disabled = batchOnly;
+    riskEl.title = batchOnly
+      ? "单批运行不用此参数；编排才按风控次数暂停"
+      : "仅持续编排：本批累计「注册风控」拒绝达到 N 次后暂停本批并分析拉黑 ASN";
+  }
 }
 function controlBody() {
   return {
@@ -3792,6 +4679,9 @@ setInterval(refreshRecovery, 5000);
 refreshBfs();
 setInterval(refreshBfs, 15000);
 refreshSsoState();
+refreshIntegrations();
+refreshRunLog(true);
+setInterval(() => refreshRunLog(false), 2000);
 setInterval(() => {
   if (document.body.classList.contains("sso-view-open") || (lastSsoState && lastSsoState.running)) {
     refreshSsoState(false);
@@ -3912,7 +4802,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/health":
             self._json(200, {"ok": True})
             return
-        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/proxies", "/api/email-provider", "/api/email-domains", "/api/bfs", "/api/sso-state"):
+        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/proxies", "/api/email-provider", "/api/email-domains", "/api/bfs", "/api/sso-state", "/api/integrations", "/api/run-log", "/api/email-provider/outlook-inventory", "/api/email-provider/outlook-state", "/api/email-provider/outlook-state/raw", "/api/auth-files", "/api/auth-files/raw", "/api/auth-files/zip", "/api/registered-emails", "/api/registered-emails/export", "/api/registered-emails/one", "/api/batch-relogin"):
             if not self._require_read():
                 return
         if u.path == "/api/status":
@@ -3968,9 +4858,129 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
+        if u.path == "/api/email-provider/outlook-inventory":
+            try:
+                qs = parse_qs(u.query or "")
+                mask = str((qs.get("mask") or ["0"])[0] or "0").lower() in ("1", "true", "yes")
+                self._json(200, read_outlook_inventory(mask=mask))
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/email-provider/outlook-state":
+            try:
+                qs = parse_qs(u.query or "")
+                limit = int((qs.get("limit") or ["500"])[0] or 500)
+                self._json(200, read_outlook_state(limit=limit))
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/email-provider/outlook-state/raw":
+            try:
+                self._json(200, read_outlook_state_raw())
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/auth-files":
+            try:
+                qs = parse_qs(u.query or "")
+                kind = (qs.get("kind") or ["cpa"])[0]
+                limit = int((qs.get("limit") or ["2000"])[0] or 2000)
+            except Exception:
+                kind, limit = "cpa", 2000
+            try:
+                self._json(200, list_auth_files(kind, limit=limit))
+            except AuthFilesError as exc:
+                self._json(400, {"ok": False, "error": str(exc)})
+            except Exception as exc:
+                self._json(500, {"ok": False, "error": str(exc)})
+            return
+        if u.path == "/api/auth-files/raw":
+            try:
+                qs = parse_qs(u.query or "")
+                kind = (qs.get("kind") or ["cpa"])[0]
+                name = (qs.get("name") or [""])[0]
+            except Exception:
+                kind, name = "cpa", ""
+            try:
+                self._json(200, read_auth_file(kind, name))
+            except AuthFilesError as exc:
+                self._json(400, {"ok": False, "error": str(exc)})
+            except Exception as exc:
+                self._json(500, {"ok": False, "error": str(exc)})
+            return
+        if u.path == "/api/auth-files/zip":
+            try:
+                qs = parse_qs(u.query or "")
+                kind = (qs.get("kind") or ["cpa"])[0]
+            except Exception:
+                kind = "cpa"
+            try:
+                self._json(200, read_auth_zip(kind))
+            except AuthFilesError as exc:
+                self._json(400, {"ok": False, "error": str(exc)})
+            except Exception as exc:
+                self._json(500, {"ok": False, "error": str(exc)})
+            return
+
+        if u.path == "/api/registered-emails":
+            try:
+                qs = parse_qs(u.query or "")
+                limit = int((qs.get("limit") or ["20000"])[0] or 20000)
+            except Exception:
+                limit = 20000
+            try:
+                self._json(200, collect_registered_accounts(limit=limit))
+            except RegisteredAccountsError as exc:
+                self._json(400, {"ok": False, "error": str(exc)})
+            except Exception as exc:
+                self._json(500, {"ok": False, "error": str(exc)})
+            return
+        if u.path == "/api/registered-emails/export":
+            try:
+                self._json(200, export_registered_emails_text())
+            except RegisteredAccountsError as exc:
+                self._json(400, {"ok": False, "error": str(exc)})
+            except Exception as exc:
+                self._json(500, {"ok": False, "error": str(exc)})
+            return
+        if u.path == "/api/registered-emails/one":
+            try:
+                qs = parse_qs(u.query or "")
+                email = (qs.get("email") or [""])[0]
+            except Exception:
+                email = ""
+            try:
+                self._json(200, read_one_registered_line(email))
+            except RegisteredAccountsError as exc:
+                self._json(400, {"ok": False, "error": str(exc)})
+            except Exception as exc:
+                self._json(500, {"ok": False, "error": str(exc)})
+            return
+
+        if u.path == "/api/batch-relogin":
+            try:
+                self._json(200, relogin_status())
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+
         if u.path == "/api/email-domains":
             try:
                 self._json(200, read_email_domain_pool())
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/integrations":
+            try:
+                self._json(200, {"ok": True, "config": read_integration_config()})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/run-log":
+            try:
+                qs = parse_qs(u.query or "")
+                lines = int((qs.get("lines") or ["300"])[0] or 300)
+                self._json(200, {"ok": True, **latest_run_log_tail(lines)})
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
@@ -3982,7 +4992,16 @@ class Handler(BaseHTTPRequestHandler):
         if not self._require_write():
             return
         try:
-            body_limit = 4 * 1024 * 1024 if u.path == "/api/sso-state/start" else None
+            body_limit = None
+            if u.path == "/api/sso-state/start":
+                body_limit = 4 * 1024 * 1024
+            elif u.path in (
+                "/api/email-provider/outlook-state",
+                "/api/email-provider/outlook-inventory",
+                "/api/registered-emails/import",
+                "/api/batch-relogin/start",
+            ):
+                body_limit = 4 * 1024 * 1024
             body = self._read_body(max_size=body_limit)
         except OverflowError as exc:
             self._json(413, {"ok": False, "error": str(exc)})
@@ -3995,6 +5014,48 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, save_control(body))
             except Exception as e:
                 self._json(500, {"error": str(e)})
+            return
+        if u.path == "/api/integrations":
+            try:
+                settings = (body or {}).get("settings") if isinstance(body, dict) else body
+                clear_secrets = (body or {}).get("clear_secrets") if isinstance(body, dict) else []
+                cfg = save_integration_config(settings or {}, clear_secrets=clear_secrets or [])
+                self._json(200, {"ok": True, "config": cfg})
+            except IntegrationConfigError as e:
+                self._json(400, {"ok": False, "error": str(e)})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+
+        if u.path == "/api/integrations/test-cpa":
+            try:
+                settings = (body or {}).get("settings") if isinstance(body, dict) else {}
+                result = test_cpa_connectivity(settings or {})
+                self._json(200 if result.get("ok") else 424, result)
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/integrations/test-g2a":
+            try:
+                settings = (body or {}).get("settings") if isinstance(body, dict) else {}
+                result = test_g2a_connectivity(settings or {})
+                self._json(200 if result.get("ok") else 424, result)
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/integrations/dry-run":
+            try:
+                settings = (body or {}).get("settings") if isinstance(body, dict) else {}
+                target_count = (body or {}).get("target_count") if isinstance(body, dict) else None
+                workers = (body or {}).get("workers") if isinstance(body, dict) else None
+                result = run_dry_run(
+                    target_count=target_count,
+                    workers=workers,
+                    settings=settings or {},
+                )
+                self._json(200 if result.get("ok") else 500, result)
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
         if u.path == "/api/start":
             try:
@@ -4073,6 +5134,15 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
+        if u.path == "/api/proxies/reorder":
+            try:
+                result = reorder_proxies(body.get("ids"))
+                self._json(200 if result.get("ok") else 400, result)
+            except ValueError as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
         if u.path == "/api/proxies/import":
             try:
                 if body.get("legacy") is True:
@@ -4109,6 +5179,35 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
+        if u.path == "/api/email-provider/outlook-inventory":
+            try:
+                text = (body or {}).get("text") if isinstance(body, dict) else ""
+                result = write_outlook_inventory(text)
+                self._json(200, result)
+            except OutlookInventoryError as e:
+                self._json(400, {"ok": False, "error": str(e)})
+            except ValueError as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/email-provider/outlook-state":
+            try:
+                payload = body or {}
+                raw = payload.get("text")
+                if raw is None and isinstance(payload.get("data"), (dict, list)):
+                    raw = payload.get("data")
+                if raw is None:
+                    raw = payload
+                result = write_outlook_state(raw)
+                self._json(200, result)
+            except OutlookInventoryError as e:
+                self._json(400, {"ok": False, "error": str(e)})
+            except ValueError as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
         if u.path == "/api/email-provider/test":
             try:
                 result = test_email_provider_config(
@@ -4119,6 +5218,55 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200 if result.get("ok") else 424, result)
             except ValueError as e:
                 self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/email-provider/outlook-inventory-check":
+            try:
+                import requests
+                from email_providers import outlook_rt as outlook_rt_provider
+                settings = body.get("settings") or {}
+                inventory = str(settings.get("outlook_accounts_file") or "").strip()
+                if not inventory:
+                    raise ValueError("未配置 outlook_accounts_file")
+                session = requests.Session()
+                session.trust_env = False
+                results = outlook_rt_provider.probe_inventory_accounts(
+                    session.get, session.post, inventory,
+                    default_client_id=str(settings.get("outlook_rt_client_id") or "").strip(),
+                )
+                self._json(200, {"ok": True, "results": results, "total": len(results)})
+            except Exception as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/registered-emails/import":
+            try:
+                raw = ""
+                if isinstance(body, dict):
+                    raw = str(body.get("text") or "")
+                result = overwrite_registered_emails(raw)
+                self._json(200 if result.get("ok") else 400, result)
+            except RegisteredAccountsError as e:
+                self._json(400, {"ok": False, "error": str(e)})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/batch-relogin/start":
+            try:
+                raw = ""
+                only_cpa = False
+                if isinstance(body, dict):
+                    raw = str(body.get("text") or body.get("emails") or "")
+                    only_cpa = body.get("only_cpa") is True
+                result = start_relogin(raw, only_cpa=only_cpa)
+                code = 200 if result.get("ok") else (409 if result.get("pid") else 400)
+                self._json(code, result)
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/batch-relogin/stop":
+            try:
+                self._json(200, stop_relogin())
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return

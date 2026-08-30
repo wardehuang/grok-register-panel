@@ -115,16 +115,23 @@ _SCRIPT_SRC_RE = re.compile(r'src=["\']([^"\']+)["\']', re.I)
 # CPA 的 internal/auth/xai/token.go TokenStorage 读的是扁平字段。
 # Build/CLI token（scope 含 grok-cli:access）必须走 cli-chat-proxy.grok.com，
 # 不能用默认 api.x.ai/v1（那是计费通道，会 402）。
-# headers 对齐 @xai-official/grok CLI / grok-build-auth（无 x-authenticateresponse）
+# CPA auth headers；client version 可由配置覆盖
 CPA_TOKEN_ENDPOINT = f"{OIDC_ISSUER}/oauth2/token"
 CPA_GROK_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
-CPA_GROK_HEADERS = {
-    "User-Agent": GROK_TOKEN_UA,
-    "X-XAI-Token-Auth": "xai-grok-cli",
-    "x-authenticateresponse": "authenticate-response",
-    "x-grok-client-identifier": "grok-pager",
-    "x-grok-client-version": GROK_VERSION,
-}
+CPA_GROK_VERSION_DEFAULT = "1.0.4"
+
+
+def build_cpa_grok_headers(cpa_grok_version: str = CPA_GROK_VERSION_DEFAULT) -> dict[str, str]:
+    version = str(cpa_grok_version or "").strip() or CPA_GROK_VERSION_DEFAULT
+    return {
+        "X-XAI-Token-Auth": "xai-grok-cli",
+        "x-grok-client-version": version,
+        "x-grok-client-identifier": "grok-shell",
+        "User-Agent": f"grok-shell/{version} (linux; x86_64)",
+    }
+
+
+CPA_GROK_HEADERS = build_cpa_grok_headers()
 CPA_PROBE_MODEL = "grok-4.5"
 CPA_PROBE_URL = f"{CPA_GROK_BASE_URL}/responses"
 GROK_HOME_URL = "https://grok.com/"
@@ -1727,6 +1734,7 @@ def token_to_cpa_record(
     *,
     bfs_info: dict | None = None,
     check_bfs: bool = True,
+    cpa_grok_version: str = CPA_GROK_VERSION_DEFAULT,
 ) -> dict:
     """token dict → CLIProxyAPI 扁平 xai auth 记录。
 
@@ -1769,7 +1777,10 @@ def token_to_cpa_record(
         "token_endpoint": CPA_TOKEN_ENDPOINT,
         "base_url": CPA_GROK_BASE_URL,
         "disabled": False,
-        "headers": dict(CPA_GROK_HEADERS),
+        "priority": 1,
+        "using_api": False,
+        "websockets": True,
+        "headers": build_cpa_grok_headers(cpa_grok_version),
     }
     sso_val = str(sso or "").strip()
     if sso_val:
@@ -1872,15 +1883,21 @@ def upload_cpa_auth_remote(
     record: dict,
     timeout: int = 30,
     proxy: str = "",
+    retries: int = 5,
+    retry_sleep_sec: float = 2.0,
 ) -> str:
     """通过 CPA Management API 上传 auth 文件到远程实例。
 
     POST /v0/management/auth-files?name=<file.json>
-    Header: Authorization: Bearer <management_key>
+    Header: Authorization: Bearer ***
     Body: raw JSON auth record
 
     使用 curl_cffi（Chrome TLS 指纹）替代标准 requests，
     避免 CPA 服务端 Cloudflare 将裸 TLS 识别为非浏览器流量返回 403。
+
+    管理 API 始终直连：忽略 proxy 参数与环境 HTTP(S)_PROXY / ALL_PROXY，
+    避免注册用 SOCKS 把 127.0.0.1 CPA 打挂。
+    CPA 重启空窗时自动重试连接错误。
     """
     base = str(base_url or "").strip().rstrip("/")
     key = str(management_key or "").strip()
@@ -1891,25 +1908,86 @@ def upload_cpa_auth_remote(
 
     name = cpa_auth_filename(record)
     url = f"{base}/v0/management/auth-files"
-    proxies = {"http": proxy, "https": proxy} if proxy else None
-    resp = requests.post(
-        url,
-        params={"name": name},
-        headers={
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-        },
-        data=json.dumps(record, ensure_ascii=False).encode("utf-8"),
-        timeout=timeout,
-        proxies=proxies,
-        impersonate="chrome",
+    # force direct: drop env proxies for this call only
+    proxy_env_keys = (
+        "http_proxy",
+        "https_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "all_proxy",
     )
-    if resp.status_code >= 400:
-        body = (resp.text or "").strip()
-        if len(body) > 300:
-            body = body[:300] + "..."
-        raise RuntimeError(f"远程上传失败 HTTP {resp.status_code}: {body or resp.reason}")
-    return name
+    try:
+        attempts = max(1, int(retries or 1))
+    except Exception:
+        attempts = 5
+    try:
+        delay = max(0.0, float(retry_sleep_sec or 0.0))
+    except Exception:
+        delay = 2.0
+
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        saved_env = {k: os.environ.pop(k) for k in proxy_env_keys if k in os.environ}
+        try:
+            session = requests.Session()
+            if hasattr(session, "trust_env"):
+                session.trust_env = False
+            session.proxies = {}
+            resp = session.post(
+                url,
+                params={"name": name},
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json",
+                },
+                data=json.dumps(record, ensure_ascii=False).encode("utf-8"),
+                timeout=timeout,
+                proxies={},
+                impersonate="chrome",
+            )
+        except Exception as exc:
+            last_exc = exc
+            msg = str(exc).lower()
+            transient = any(
+                token in msg
+                for token in (
+                    "failed to connect",
+                    "could not connect",
+                    "connection refused",
+                    "connection reset",
+                    "timed out",
+                    "timeout",
+                    "curl: (7)",
+                    "curl: (28)",
+                )
+            )
+            if (not transient) or attempt >= attempts:
+                raise
+            time.sleep(delay * attempt)
+            continue
+        finally:
+            os.environ.update(saved_env)
+
+        if resp.status_code >= 400:
+            body = (resp.text or "").strip()
+            if len(body) > 300:
+                body = body[:300] + "..."
+            # 5xx during restart → retry
+            if resp.status_code >= 500 and attempt < attempts:
+                last_exc = RuntimeError(
+                    f"远程上传失败 HTTP {resp.status_code}: {body or resp.reason}"
+                )
+                time.sleep(delay * attempt)
+                continue
+            raise RuntimeError(
+                f"远程上传失败 HTTP {resp.status_code}: {body or resp.reason}"
+            )
+        return name
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("远程上传失败：未知错误")
 
 
 def write_auth_json(path: Path, auth_key: str, entry: dict) -> None:
@@ -2080,6 +2158,7 @@ def _config_bool(value: object, default: bool = False) -> bool:
 
 def apply_config_defaults(args) -> None:
     if not args.from_config:
+        args.cpa_grok_version = args.cpa_grok_version or CPA_GROK_VERSION_DEFAULT
         if getattr(args, "bfs_check", None) is None:
             args.bfs_check = True
         if getattr(args, "bfs_skip_write", None) is None:
@@ -2098,6 +2177,9 @@ def apply_config_defaults(args) -> None:
     args.cpa_remote_url = args.cpa_remote_url or str(config.get("cpa_remote_url") or "").strip()
     args.cpa_management_key = args.cpa_management_key or str(config.get("cpa_management_key") or "").strip()
     args.proxy = args.proxy or str(config.get("proxy") or "").strip()
+    args.cpa_grok_version = args.cpa_grok_version or str(
+        config.get("cpa_grok_version") or CPA_GROK_VERSION_DEFAULT
+    ).strip()
     if getattr(args, "bfs_check", None) is None:
         args.bfs_check = _config_bool(config.get("bfs_check"), True)
     if getattr(args, "bfs_skip_write", None) is None:
@@ -2154,6 +2236,11 @@ def main() -> int:
     ap.add_argument("--sso-cookie", metavar="JWT", help="单个 sso cookie")
     ap.add_argument("--accounts-dir", metavar="DIR", help="扫描 accounts 目录内可恢复的 txt 账号")
     ap.add_argument("--from-config", metavar="FILE", help="从 config.json 读取 CPA、Grok2API 和代理默认值")
+    ap.add_argument(
+        "--cpa-grok-version",
+        default=None,
+        help="CPA auth header 的 Grok client version（默认 1.0.4）",
+    )
     ap.add_argument("--out", default=None, help="输出 auth.json 路径（单账号或 --merge）")
     ap.add_argument(
         "--out-dir",
@@ -2474,6 +2561,7 @@ def main() -> int:
                     sso=sso,
                     bfs_info=bfs_info if args.bfs_check else None,
                     check_bfs=args.bfs_check,
+                    cpa_grok_version=args.cpa_grok_version,
                 )
                 if args.bfs_disable and cpa_record.get("bfs") is True:
                     cpa_record["disabled"] = True
@@ -2486,7 +2574,7 @@ def main() -> int:
                         args.cpa_remote_url,
                         args.cpa_management_key,
                         cpa_record,
-                        proxy=args.proxy,
+                        proxy="",
                     )
                     print(f"  💾 CPA 远程 → {args.cpa_remote_url.rstrip('/')}/.../{name}")
 

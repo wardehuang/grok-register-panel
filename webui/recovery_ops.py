@@ -175,6 +175,8 @@ def start_recovery(scope: str = "pending") -> dict:
         return {"ok": False, "error": f"unknown recovery scope: {normalized_scope}"}
     if find_managed_processes(ROOT, ("run_until_100.py", "run_batch_headless.py")):
         return {"ok": False, "error": "registration task is running"}
+    if find_managed_processes(ROOT, ("run_batch_relogin.py",)):
+        return {"ok": False, "error": "batch relogin is running"}
     existing = find_managed_processes(ROOT, ("sso_to_auth_json.py",))
     if existing:
         return {"ok": False, "error": "recovery already running", "pid": existing[0]["pid"]}

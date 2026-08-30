@@ -9,6 +9,7 @@ from __future__ import annotations
 import gc
 import ipaddress
 import os
+import psutil
 import shutil
 import tempfile
 import threading
@@ -538,6 +539,80 @@ def _cleanup_profile_dir(profile_dir=None) -> None:
         _rmtree_with_retry(path)
 
 
+def _normalize_process_text(value: object) -> str:
+    return os.path.normcase(str(value or "").replace("\\", "/")).rstrip("/")
+
+
+def _profile_processes(profile_dir=None) -> list:
+    """查找指定临时 profile 对应的浏览器及其驱动进程。"""
+    path = str(profile_dir or "")
+    if not _is_managed_profile_dir(path):
+        return []
+    marker = _normalize_process_text(path)
+    current_pid = os.getpid()
+    roots = []
+    for process in psutil.process_iter(["pid", "cmdline"]):
+        if process.pid == current_pid:
+            continue
+        try:
+            command = _normalize_process_text(" ".join(process.info.get("cmdline") or []))
+        except (psutil.Error, OSError, TypeError, ValueError):
+            continue
+        if marker and marker in command:
+            roots.append(process)
+
+    ordered = []
+    seen = set()
+
+    def add(process):
+        if process.pid in seen or process.pid == current_pid:
+            return
+        seen.add(process.pid)
+        ordered.append(process)
+
+    for root in roots:
+        try:
+            children = root.children(recursive=True)
+        except (psutil.Error, OSError):
+            children = []
+        for child in reversed(children):
+            add(child)
+        add(root)
+        try:
+            parent = root.parent()
+            ancestors = []
+            while parent is not None and parent.pid not in (current_pid, 1):
+                ancestors.append(parent)
+                parent = parent.parent()
+            if parent is not None and parent.pid == current_pid:
+                for ancestor in ancestors:
+                    add(ancestor)
+        except (psutil.Error, OSError):
+            pass
+    return ordered
+
+
+def _terminate_profile_process_tree(profile_dir=None, grace_seconds: float = 5.0) -> int:
+    """有界终止指定 profile 的 Camoufox/Playwright 进程树。"""
+    processes = _profile_processes(profile_dir)
+    if not processes:
+        return 0
+    for process in processes:
+        try:
+            process.terminate()
+        except (psutil.Error, OSError):
+            pass
+    _gone, alive = psutil.wait_procs(processes, timeout=max(0.0, grace_seconds))
+    for process in alive:
+        try:
+            process.kill()
+        except (psutil.Error, OSError):
+            pass
+    if alive:
+        psutil.wait_procs(alive, timeout=2)
+    return len(processes)
+
+
 def cleanup_stale_profiles(log_callback=None) -> int:
     """启动时清理上次崩溃 / 强杀残留的临时 profile 目录。
 
@@ -570,6 +645,7 @@ def cleanup_stale_profiles(log_callback=None) -> int:
                 owner_pid = int(match.group(1))
                 if owner_pid == current_pid or _pid_alive(owner_pid):
                     continue
+                _terminate_profile_process_tree(str(entry_path))
                 if _rmtree_with_retry(str(entry_path)):
                     cleaned += 1
         except Exception:
@@ -1014,13 +1090,19 @@ def stop_browser(force=False):
     profile_dir = getattr(_tls, "profile_dir", None)
     set_browser_session(None, None)
     if current is None:
+        _terminate_profile_process_tree(profile_dir)
         _cleanup_profile_dir(profile_dir)
         return
     try:
+        # Playwright Sync API 的 Connection / greenlet / asyncio loop 绑定创建线程。
+        # 必须在同一 worker 线程关闭，不能把 quit() 丢给后台线程。
         current.quit(del_data=True)
     except BaseException:
         pass
-    _cleanup_profile_dir(profile_dir)
+    finally:
+        # 只有 owner-thread quit 完成后，才能强制回收残留浏览器进程。
+        _terminate_profile_process_tree(profile_dir)
+        _cleanup_profile_dir(profile_dir)
 
 
 def restart_browser(log_callback=None):

@@ -51,6 +51,16 @@ def _write_output(text: str) -> None:
         if buffer is not None:
             buffer.write(text.encode("utf-8", errors="replace"))
             buffer.flush()
+    # Mirror supervisor-only lines into the shared launch run log.
+    try:
+        if "[supervisor]" in text:
+            from run_log import append_run_log
+
+            for line in str(text).splitlines():
+                if "[supervisor]" in line:
+                    append_run_log(line)
+    except Exception:
+        pass
 
 
 def _read_pipe(pipe, output: queue.Queue) -> None:
@@ -253,6 +263,12 @@ def run_supervisor(
                     f"[supervisor] restart limit reached remaining={remaining} restarts={restarts}",
                     flush=True,
                 )
+                try:
+                    from run_log import update_run_stats
+
+                    update_run_stats(restarts=restarts, notes="restart_limit_reached")
+                except Exception:
+                    pass
                 return 1
 
             command = [str(part) for part in child_command_builder(remaining, worker_count)]
@@ -352,6 +368,12 @@ def run_supervisor(
                     f"[supervisor] {restart_reason}; restarting remaining={remaining} attempt={restarts}/{max_restarts}",
                     flush=True,
                 )
+                try:
+                    from run_log import update_run_stats
+
+                    update_run_stats(restarts=restarts, notes=restart_reason)
+                except Exception:
+                    pass
                 time.sleep(min(1.0 * restarts, 5.0))
                 continue
 

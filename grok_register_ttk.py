@@ -38,6 +38,8 @@ from email_providers import duckmail as duckmail_provider
 from email_providers import mailnest as mailnest_provider
 from email_providers import moemail as moemail_provider
 from email_providers import outlook_rt as outlook_rt_provider
+from email_providers import outlook_alias_pool as outlook_alias_pool_mod
+import proxy_cursor as proxy_cursor_mod
 from email_providers import yyds as yyds_provider
 from email_providers.common import extract_verification_code as _extract_code
 from email_providers.common import generate_username as _generate_username
@@ -48,6 +50,31 @@ import register_flow as _rf
 import connectivity as _conn
 from batch_supervisor import mark_slot_completed
 from batch_traffic import mark_successful_account
+import integrations_push
+import atexit
+atexit.register(lambda: stop_run_log())
+try:
+    from run_log import (
+        append_run_log,
+        ensure_run_log,
+        finalize_run_log,
+        start_run_log,
+        stop_run_log,
+        update_run_stats,
+    )
+except Exception:  # pragma: no cover
+    def start_run_log(kind="cli", force_new=False):
+        return None
+    def ensure_run_log(kind="cli"):
+        return None
+    def append_run_log(line):
+        return None
+    def stop_run_log():
+        return None
+    def update_run_stats(**fields):
+        return None
+    def finalize_run_log(reason="completed", **kwargs):
+        return None
 from retry_policy import proxy_boot_rotations, slot_retries
 from secure_files import (
     append_private_text,
@@ -63,6 +90,7 @@ from webui.proxy_store import (
     note_proxy_exit as _note_managed_proxy_exit,
     record_proxy_result as _record_managed_proxy_result,
     restore_home_proxies as _restore_home_proxies,
+    sync_worker_proxy_file as _sync_worker_proxy_file,
     worker_proxy_details as _managed_worker_proxy_details,
     worker_proxy_snapshot as _managed_worker_proxy_snapshot,
 )
@@ -144,6 +172,53 @@ def account_file_for_email(email):
     return os.path.join(ACCOUNTS_DIR, f"{safe_email}.txt")
 
 
+def persist_registered_email(
+    email: str,
+    password: str = "",
+    sso: str | None = "",
+    *,
+    keep_existing_sso_if_empty: bool = True,
+    also_account_file: bool = False,
+    log_callback=None,
+) -> bool:
+    """写入 accounts/registered_emails.txt；可选同步 accounts/{email}.txt。
+
+    注册成功即写；SSO 可为空。返回 True 表示至少 registered_emails 写入成功。
+    """
+    em = str(email or "").strip()
+    pwd = str(password or "")
+    if not em or "@" not in em:
+        return False
+    ok = False
+    try:
+        from webui.registered_accounts_store import upsert_registered_account
+
+        upsert_registered_account(
+            em,
+            pwd,
+            sso=sso,
+            keep_existing_sso_if_empty=keep_existing_sso_if_empty,
+        )
+        ok = True
+        if log_callback:
+            sso_s = "" if sso is None else str(sso or "").strip()
+            flag = "yes" if sso_s else ("keep/empty" if sso is None else "empty")
+            log_callback(f"[*] registered_emails 已更新: {em} sso={flag}")
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[!] registered_emails 写入失败: {exc}")
+    if also_account_file and pwd:
+        try:
+            sso_s = "" if sso is None else str(sso or "").strip()
+            if sso_s:
+                line = f"{em}----{pwd}----{sso_s}\n"
+                atomic_write_text(account_file_for_email(em), line)
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[!] accounts/{{email}}.txt 写入失败: {exc}")
+    return ok
+
+
 def accounts_side_file(name):
     """accounts/ 下的附属文件路径（mail_credentials / sso_pending 等）。"""
     ensure_accounts_dir()
@@ -220,6 +295,8 @@ DEFAULT_CONFIG = {
     "cpa_auto_add": False,
     # Token 换取方式：device_protocol（协议 Device Flow，默认）/ device_browser（浏览器 Device Flow）/ auth_code
     "cpa_token_mode": "device_protocol",
+    # CPA auth JSON 的 Grok client version，可在面板中设置
+    "cpa_grok_version": _s2cpa.CPA_GROK_VERSION_DEFAULT,
     # CPA 本地 auth 目录（默认项目根目录下 cpa_auth/）
     "cpa_auth_dir": "cpa_auth",
     # 远程 CPA：通过 Management API POST /v0/management/auth-files 上传
@@ -240,8 +317,30 @@ DEFAULT_CONFIG = {
     "outlook_rt_inventory": "",
     "outlook_rt_used_path": "",
     "outlook_rt_client_id": outlook_rt_provider.DEFAULT_CLIENT_ID,
+    # Outlook/Hotmail plus 别名（lite-patch 兼容 state）
+    "outlook_accounts_file": "accounts/outlook_accounts.txt",
+    "outlook_state_file": "accounts/outlook_state.json",
+    "outlook_aliases_per_account": 10,
+    "outlook_use_alias_pool": True,
     # 账号间注册间隔（秒），0=不等待。填一个整数=N秒固定等待，填区间"60-120"=随机等待
     "account_interval": "60-120",
+    # 创建间隔（秒）别名；优先 account_interval
+    "register_interval_sec": 0,
+    # 顺序 IP 游标（一号一口）；早失败可回退
+    "proxy_cursor_enabled": True,
+    "proxy_pool_file": "proxies.txt",
+    "proxy_pool_state_file": "log/proxy_pool_state.json",
+    # 启动不测活 / 不拦 xAI 预检
+    "skip_connectivity_precheck": True,
+    "skip_xai_signup_precheck": True,
+    # grok2api 远端 Web/Console SSO 推送
+    "grok2api_auto_add_remote": True,
+    "grok2api_remote_base": "",
+    "grok2api_remote_username": "",
+    "grok2api_remote_password": "",
+    "grok2api_remote_app_key": "",
+    "grok2api_remote_retries": 3,
+    "grok2api_remote_retry_sleep_sec": 2.0,
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -497,6 +596,99 @@ def format_fail_stats(stats: dict) -> str:
     return " | ".join(parts)
 
 
+# 运行中细粒度统计（日志「当前统计」）
+DETAIL_STAT_ORDER = (
+    ("register_ok", "注册成功"),
+    ("register_fail", "注册失败"),
+    ("sso_ok", "SSO成功"),
+    ("sso_fail", "SSO失败"),
+    ("early_skip", "早期跳过"),
+    ("g2a_ok", "G2A成功"),
+    ("g2a_fail", "G2A失败"),
+    ("cpa_ok", "CPA成功"),
+    ("cpa_fail", "CPA失败"),
+    ("risk_ok", "风控通过"),
+    ("risk_fail", "风控"),
+)
+
+
+def empty_detail_stats() -> dict:
+    return {key: 0 for key, _ in DETAIL_STAT_ORDER}
+
+
+def format_detail_stats(stats: dict | None) -> str:
+    data = stats or {}
+    parts = []
+    for key, label in DETAIL_STAT_ORDER:
+        parts.append(f"{label} {int(data.get(key) or 0)}")
+    return " | ".join(parts)
+
+
+def bump_detail_stats(stats: dict | None, key: str, n: int = 1, lock=None) -> None:
+    if stats is None or not key:
+        return
+    delta = int(n or 0)
+    if delta == 0:
+        return
+
+    def _do() -> None:
+        stats[key] = int(stats.get(key) or 0) + delta
+
+    if lock is not None:
+        with lock:
+            _do()
+    else:
+        _do()
+
+
+def note_failure_detail(stats: dict | None, kind: str, lock=None) -> None:
+    """Map classified failure kind → detail counters."""
+    k = str(kind or "")
+    if k == FAIL_DOMAIN:
+        bump_detail_stats(stats, "early_skip", lock=lock)
+        return
+    if k == FAIL_SSO:
+        bump_detail_stats(stats, "sso_fail", lock=lock)
+        bump_detail_stats(stats, "register_fail", lock=lock)
+        return
+    if k == FAIL_RISK:
+        # risk_fail 已在 finalize_sso_after_register 内计数
+        bump_detail_stats(stats, "register_fail", lock=lock)
+        return
+    bump_detail_stats(stats, "register_fail", lock=lock)
+
+
+def format_current_stats_line(
+    success_count: int = 0,
+    fail_count: int = 0,
+    detail_stats: dict | None = None,
+) -> str:
+    """Human line for live progress."""
+    detail = format_detail_stats(detail_stats)
+    return (
+        f"[*] 当前统计: 成功 {int(success_count)} | 失败 {int(fail_count)} || {detail}"
+    )
+
+
+
+def push_live_run_stats(success_count=0, fail_count=0, fail_stats=None, detail_stats=None, target=None):
+    """Persist counters during run so stop/kill still leaves a usable summary."""
+    try:
+        payload = {
+            "success": int(success_count or 0),
+            "fail": int(fail_count or 0),
+            "completed": int(success_count or 0) + int(fail_count or 0),
+        }
+        if fail_stats is not None:
+            payload["fail_stats"] = dict(fail_stats or {})
+        if detail_stats is not None:
+            payload["detail_stats"] = dict(detail_stats or {})
+        if target is not None:
+            payload["target"] = int(target or 0)
+        update_run_stats(**payload)
+    except Exception:
+        pass
+
 
 def load_config():
     global config
@@ -510,15 +702,30 @@ def load_config():
     return config
 
 
-def _sleep_cancelable(seconds, should_stop=None) -> None:
-    """Sleep in short slices so stop flags can interrupt account gaps."""
-    end = time.time() + max(0.0, float(seconds or 0))
+def _sleep_cancelable(seconds, should_stop=None, log_callback=None, heartbeat_sec=60.0) -> None:
+    """Sleep in short slices so stop flags can interrupt account gaps.
+
+    Emits heartbeat logs so batch supervisor idle timeout won't kill long waits.
+    """
+    total = max(0.0, float(seconds or 0))
+    if total <= 0:
+        return
+    end = time.time() + total
+    beat = max(15.0, float(heartbeat_sec or 60.0))
+    next_beat = time.time() + min(beat, total)
     while time.time() < end:
         if callable(should_stop) and should_stop():
             return
-        remaining = end - time.time()
+        now = time.time()
+        remaining = end - now
         if remaining <= 0:
             break
+        if callable(log_callback) and now >= next_beat:
+            try:
+                log_callback(f"[*] 账号间隔等待中… 剩余 {remaining:.0f}s / 共 {total:.0f}s")
+            except Exception:
+                pass
+            next_beat = now + beat
         time.sleep(min(0.5, remaining))
 
 
@@ -530,6 +737,8 @@ def parse_account_interval() -> float:
     "60-120" → 60~120 之间的随机值
     """
     raw = str(config.get("account_interval", "0") or "0").strip()
+    if (not raw or raw == "0") and config.get("register_interval_sec"):
+        raw = str(config.get("register_interval_sec") or "0").strip()
     if not raw or raw == "0":
         return 0.0
     if "-" in raw:
@@ -625,12 +834,9 @@ def reserve_signup_submit_slot(gap: float | None = None) -> float:
 
 
 def load_proxy_pool(path: str = "") -> list:
-    """热加载健康面板代理；无可用项时兼容 proxies.txt / config.proxy。"""
+    """热加载托管池顺序；未配置托管池时才读取 legacy proxies.txt / config.proxy。"""
     global _proxy_pool, _proxy_pool_source
-    try:
-        managed_snapshot = _managed_worker_proxy_snapshot()
-    except Exception:
-        managed_snapshot = {"configured": False, "urls": []}
+    managed_snapshot = _managed_worker_proxy_snapshot()
     managed = list(managed_snapshot.get("urls") or [])
     if managed_snapshot.get("configured"):
         with _proxy_pool_lock:
@@ -675,20 +881,54 @@ def get_thread_proxy() -> str:
     return str(getattr(_proxy_tls, "proxy", "") or "").strip()
 
 
-def release_proxy_lease(worker_id: int | None = None) -> None:
-    """释放某个 worker 占用的出口；worker_id 为空则清空。"""
-    with _proxy_lease_lock:
-        if worker_id is None:
+def release_proxy_lease(worker_id: int | None = None, *, rewind: bool = True) -> None:
+    """释放 worker 代理占用。
+
+    rewind=True（默认，早失败）：回退 IP 游标。
+    rewind=False（注册成功）：只清占用，不回退游标。
+    """
+    if worker_id is None:
+        with _proxy_lease_lock:
             _proxy_leases.clear()
-            return
-        _proxy_leases.pop(int(worker_id), None)
+        with _proxy_cursor_lease_lock:
+            idxs = list(_proxy_cursor_leases.items())
+            _proxy_cursor_leases.clear()
+        if rewind:
+            for wid, idx in idxs:
+                try:
+                    cur = _get_proxy_cursor()
+                    if cur is not None:
+                        cur.release_allocation(int(idx))
+                except Exception:
+                    pass
+        return
+    wid = int(worker_id)
+    with _proxy_lease_lock:
+        _proxy_leases.pop(wid, None)
+    if rewind:
+        release_proxy_cursor_for_worker(wid)
+    else:
+        with _proxy_cursor_lease_lock:
+            _proxy_cursor_leases.pop(wid, None)
 
 
 def pick_proxy_for_worker(worker_id: int, rotate_idx: int = 0) -> str:
-    """账号边界选口：跳过别人占用的，优先 40 分钟内没出现过的出口 IP。
-
-    风控前置：当前口的 IP 若在窗口内用过，即使 rotate_idx=0 也换一条冷 IP。
-    """
+    """账号边界选口：优先顺序游标一号一口；否则走托管池冷 IP 逻辑。"""
+    cursor = _get_proxy_cursor()
+    if cursor is not None:
+        wid = max(0, int(worker_id))
+        # rotate: release previous cursor slot then allocate next
+        if int(rotate_idx or 0) > 0:
+            release_proxy_cursor_for_worker(wid)
+        try:
+            url, index = cursor.allocate()
+        except Exception as exc:
+            raise RuntimeError(f"代理游标分配失败: {exc}") from exc
+        with _proxy_cursor_lease_lock:
+            _proxy_cursor_leases[wid] = int(index)
+        with _proxy_lease_lock:
+            _proxy_leases[wid] = url
+        return url
     pool = load_proxy_pool()
     details = []
     try:
@@ -1108,10 +1348,100 @@ def ensure_sso_oauth_eligible(raw_token, email="", log_callback=None) -> dict:
     return state
 
 
-def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
-    """SSO → Device Flow（失败回退授权码）换 token → 写入 CPA / Grok2API。
 
-    返回 True 表示入库成功（或未开启/无需转换）；False 表示转换失败（SSO 仍可能已写入 accounts）。
+def push_sso_to_grok2api_remotes(raw_token, email="", log_callback=None) -> dict:
+    """拿到 SSO 后立刻推 grok2api Web + Console（不换 CPA token）。"""
+    return integrations_push.push_sso_to_grok2api_web_and_console(
+        http_post,
+        config,
+        raw_token,
+        email=email,
+        log_callback=log_callback,
+    )
+
+
+def _tee_run_log(message: str) -> None:
+    try:
+        append_run_log(str(message or ""))
+    except Exception:
+        pass
+
+
+def finalize_sso_after_register(
+    raw_token,
+    email="",
+    log_callback=None,
+    detail_stats=None,
+    detail_lock=None,
+    only_cpa=False,
+) -> bool:
+    """SSO 后处理顺序：
+    1) 默认推送 grok2api Web + Console；only_cpa=True 时跳过
+    2) 风控检查 botFlagSource
+    3) 通过才 Device Flow 换 token 并写/推 CPA
+    风控失败：正常模式下已推 g2a；两种模式都不推 CPA，抛 RegistrationRiskDenied
+    """
+    sso = _normalize_sso_token(raw_token)
+    if not sso:
+        bump_detail_stats(detail_stats, "cpa_fail", lock=detail_lock)
+        return False
+    g2a_ok = False
+    try:
+        if only_cpa:
+            if log_callback:
+                log_callback("[*] 仅推送CPA：跳过 Grok2API Web/Console 推送")
+            g2a_res = {"skipped": True}
+        else:
+            g2a_res = push_sso_to_grok2api_remotes(
+                sso,
+                email=email,
+                log_callback=log_callback,
+            ) or {}
+        if g2a_res.get("skipped"):
+            g2a_ok = False
+        else:
+            g2a_ok = bool(g2a_res.get("remote_web_ok")) and bool(
+                g2a_res.get("remote_console_ok")
+            )
+            if g2a_ok:
+                bump_detail_stats(detail_stats, "g2a_ok", lock=detail_lock)
+            else:
+                # 未配置跳过不记失败；已尝试但未双端成功记失败
+                if g2a_res.get("remote_web_ok") or g2a_res.get("remote_console_ok"):
+                    # 单端成功：仍记 G2A成功（至少推上一个）
+                    bump_detail_stats(detail_stats, "g2a_ok", lock=detail_lock)
+                    if not (
+                        bool(g2a_res.get("remote_web_ok"))
+                        and bool(g2a_res.get("remote_console_ok"))
+                    ):
+                        bump_detail_stats(detail_stats, "g2a_fail", lock=detail_lock)
+                else:
+                    bump_detail_stats(detail_stats, "g2a_fail", lock=detail_lock)
+    except Exception as exc:
+        bump_detail_stats(detail_stats, "g2a_fail", lock=detail_lock)
+        if log_callback:
+            log_callback(f"[!] grok2api 推送异常（继续风控/CPA）: {exc}")
+    # 风控：失败则不再 CPA
+    try:
+        ensure_sso_oauth_eligible(sso, email=email, log_callback=log_callback)
+        bump_detail_stats(detail_stats, "risk_ok", lock=detail_lock)
+    except RegistrationRiskDenied:
+        bump_detail_stats(detail_stats, "risk_fail", lock=detail_lock)
+        raise
+    cpa_ok = bool(add_sso_to_cpa(sso, email=email, log_callback=log_callback))
+    bump_detail_stats(
+        detail_stats,
+        "cpa_ok" if cpa_ok else "cpa_fail",
+        lock=detail_lock,
+    )
+    return cpa_ok
+
+
+def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
+    """SSO → Device Flow 换 token → 写入 CPA（本地/远程）。
+
+    调用前应已完成 grok2api SSO 推送与风控检查。
+    返回 True 表示 CPA 入库成功（或未开启）；False 表示转换失败。
     """
     if not config.get("cpa_auto_add", False):
         if log_callback:
@@ -1249,6 +1579,7 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
             sso=sso,
             bfs_info=bfs_info if bfs_check else None,
             check_bfs=bool(bfs_check),
+            cpa_grok_version=config["cpa_grok_version"],
         )
         ap = _s2cpa.decode_jwt_payload(record.get("access_token", ""))
         ref = ap.get("referrer")
@@ -1270,7 +1601,10 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
                 _cpa_log(f"CPA 本地写入失败: {local_exc}")
         if remote_url:
             try:
-                name = _s2cpa.upload_cpa_auth_remote(remote_url, management_key, record, proxy=proxy)
+                # CPA 管理 API 本机/内网：强制直连，不用注册 SOCKS
+                name = _s2cpa.upload_cpa_auth_remote(
+                    remote_url, management_key, record, proxy=""
+                )
                 _cpa_log(f"已上传 CPA 远程 {remote_url.rstrip('/')}/.../{name}")
                 wrote_ok = True
             except Exception as remote_exc:
@@ -1391,13 +1725,26 @@ def raise_if_cancelled(cancel_callback=None):
         raise RegistrationCancelled("用户停止注册")
 
 
-def sleep_with_cancel(seconds, cancel_callback=None):
-    deadline = time.time() + max(seconds, 0)
+def sleep_with_cancel(seconds, cancel_callback=None, log_callback=None, heartbeat_sec=60.0):
+    total = max(0.0, float(seconds or 0))
+    if total <= 0:
+        raise_if_cancelled(cancel_callback)
+        return
+    deadline = time.time() + total
+    beat = max(15.0, float(heartbeat_sec or 60.0))
+    next_beat = time.time() + min(beat, total)
     while True:
         raise_if_cancelled(cancel_callback)
-        remaining = deadline - time.time()
+        now = time.time()
+        remaining = deadline - now
         if remaining <= 0:
             return
+        if callable(log_callback) and now >= next_beat:
+            try:
+                log_callback(f"[*] 账号间隔等待中… 剩余 {remaining:.0f}s / 共 {total:.0f}s")
+            except Exception:
+                pass
+            next_beat = now + beat
         time.sleep(min(0.2, remaining))
 
 
@@ -1872,7 +2219,151 @@ def get_outlook_rt_client_id():
     )
 
 
+
+_alias_pool_singleton = None
+_proxy_cursor_singleton = None
+_proxy_cursor_leases = {}  # worker_id -> index
+_proxy_cursor_lease_lock = threading.Lock()
+
+
+def _resolve_path_cfg(key: str, default: str = "") -> str:
+    raw = str(config.get(key, default) or default).strip()
+    if not raw:
+        return ""
+    if os.path.isabs(raw):
+        return raw
+    return os.path.join(APP_DIR, raw)
+
+
+def _get_outlook_alias_pool():
+    global _alias_pool_singleton
+    if _alias_pool_singleton is not None:
+        return _alias_pool_singleton
+    accounts = _resolve_path_cfg("outlook_accounts_file", "accounts/outlook_accounts.txt")
+    state = _resolve_path_cfg("outlook_state_file", "accounts/outlook_state.json")
+    try:
+        cap = int(config.get("outlook_aliases_per_account", 10) or 10)
+    except Exception:
+        cap = 10
+    _alias_pool_singleton = outlook_alias_pool_mod.OutlookAliasPool.build(
+        accounts, state, aliases_per_account=max(1, cap)
+    )
+    return _alias_pool_singleton
+
+
+def outlook_alias_take_mailbox():
+    pool = _get_outlook_alias_pool()
+    alias_email, lease = pool.allocate_alias()
+    primary = pool.get_account_for_alias_lease(lease, alias_email)
+    account = {
+        "email": primary.email,
+        "password": primary.password,
+        "client_id": primary.client_id or get_outlook_rt_client_id(),
+        "refresh_token": primary.refresh_token,
+    }
+    token_key = outlook_rt_provider.bind_external_session(
+        alias_email=alias_email,
+        account=account,
+        lease_token=lease,
+        default_client_id=get_outlook_rt_client_id(),
+        alias_mode=True,
+    )
+    # optional refresh precheck
+    try:
+        outlook_rt_provider.refresh_access_token(
+            http_post,
+            account,
+            default_client_id=get_outlook_rt_client_id(),
+        )
+    except Exception as exc:
+        try:
+            pool.release_alias(lease, alias_email)
+        except Exception:
+            pass
+        try:
+            outlook_rt_provider.release_reservation(token_key, alias_email)
+        except Exception:
+            pass
+        raise Exception(f"Outlook 别名主号 refresh 失败: {exc}") from exc
+    return alias_email, token_key
+
+
+def release_outlook_alias_if_needed(email: str = "", dev_token: str = "") -> None:
+    """Early-fail: roll back latest alias allocation when possible."""
+    try:
+        info = outlook_rt_provider.peek_session(dev_token, email)
+    except Exception:
+        return
+    if not info.get("alias_mode"):
+        try:
+            outlook_rt_provider.release_reservation(dev_token, email)
+        except Exception:
+            pass
+        return
+    lease = str(info.get("lease_token") or "")
+    alias = str(info.get("email") or email or "")
+    try:
+        pool = _get_outlook_alias_pool()
+        if lease and alias:
+            pool.release_alias(lease, alias)
+    except Exception:
+        pass
+    try:
+        outlook_rt_provider.release_reservation(dev_token, email)
+    except Exception:
+        pass
+
+
+def is_outlook_alias_pool_exhausted(exc) -> bool:
+    """True when no more Outlook aliases can be allocated."""
+    if isinstance(exc, outlook_alias_pool_mod.OutlookAccountPoolExhausted):
+        return True
+    name = type(exc).__name__
+    if name == "OutlookAccountPoolExhausted":
+        return True
+    msg = str(exc or "")
+    return ("账号池已耗尽" in msg) or ("Outlook 账号池已耗尽" in msg)
+
+
+def _get_proxy_cursor():
+    global _proxy_cursor_singleton
+    if not config.get("proxy_cursor_enabled", True):
+        return None
+    pool_file = _resolve_path_cfg("proxy_pool_file", "proxies.txt")
+    state_file = _resolve_path_cfg("proxy_pool_state_file", "log/proxy_pool_state.json")
+    if not pool_file:
+        return None
+    synced_file = _sync_worker_proxy_file(pool_file)
+    if synced_file is None:
+        return None
+    try:
+        if _proxy_cursor_singleton is None:
+            _proxy_cursor_singleton = proxy_cursor_mod.ProxyCursor(synced_file, state_file)
+        return _proxy_cursor_singleton
+    except proxy_cursor_mod.ProxyCursorError:
+        return None
+
+
+def release_proxy_cursor_for_worker(worker_id: int, log_callback=None) -> None:
+    with _proxy_cursor_lease_lock:
+        idx = _proxy_cursor_leases.pop(int(worker_id), None)
+    if idx is None:
+        return
+    cursor = _get_proxy_cursor()
+    if cursor is None:
+        return
+    try:
+        cursor.release_allocation(int(idx), log_callback=log_callback)
+    except Exception:
+        pass
+
+
 def outlook_rt_take_mailbox():
+    if config.get("outlook_use_alias_pool", True):
+        accounts = _resolve_path_cfg("outlook_accounts_file", "accounts/outlook_accounts.txt")
+        state = _resolve_path_cfg("outlook_state_file", "accounts/outlook_state.json")
+        if accounts and state and os.path.isfile(accounts):
+            return outlook_alias_take_mailbox()
     inv = get_outlook_rt_inventory()
     if not inv:
         raise Exception(
@@ -2615,6 +3106,7 @@ class GrokRegisterGUI:
         self.batch_count = 0
         self.success_count = 0
         self.fail_count = 0
+        self.detail_stats = empty_detail_stats()
         self.results = []
         self.stop_requested = False
         self.ui_queue = queue.Queue()
@@ -3221,6 +3713,10 @@ class GrokRegisterGUI:
     def log(self, message):
         if not should_emit_log(message):
             return
+        try:
+            _tee_run_log(message)
+        except Exception:
+            pass
         if self._queue_ui_call(self.log, message):
             return
         from runtime_platform import beijing_strftime
@@ -3238,13 +3734,13 @@ class GrokRegisterGUI:
     def update_stats(self):
         if self._queue_ui_call(self.update_stats):
             return
+        detail = format_detail_stats(getattr(self, "detail_stats", None) or empty_detail_stats())
         fail_detail = format_fail_stats(getattr(self, "fail_stats", {}) or {})
+        base = f"成功: {self.success_count} | 失败: {self.fail_count}"
         if self.fail_count:
-            self.stats_var.set(
-                f"成功: {self.success_count} | 失败: {self.fail_count}（{fail_detail}）"
-            )
+            self.stats_var.set(f"{base}（{fail_detail}） || {detail}")
         else:
-            self.stats_var.set(f"成功: {self.success_count} | 失败: 0")
+            self.stats_var.set(f"{base} || {detail}")
         self._update_progress()
 
     def _update_progress(self):
@@ -3352,11 +3848,26 @@ class GrokRegisterGUI:
                 if not hasattr(self, "fail_stats") or self.fail_stats is None:
                     self.fail_stats = empty_fail_stats()
                 self.fail_stats[kind] = self.fail_stats.get(kind, 0) + 1
+                if not hasattr(self, "detail_stats") or self.detail_stats is None:
+                    self.detail_stats = empty_detail_stats()
         else:
             self.fail_count += 1
             if not hasattr(self, "fail_stats") or self.fail_stats is None:
                 self.fail_stats = empty_fail_stats()
             self.fail_stats[kind] = self.fail_stats.get(kind, 0) + 1
+            if not hasattr(self, "detail_stats") or self.detail_stats is None:
+                self.detail_stats = empty_detail_stats()
+        note_failure_detail(getattr(self, "detail_stats", None), kind, lock=lock)
+        try:
+            push_live_run_stats(
+                self.success_count,
+                self.fail_count,
+                getattr(self, "fail_stats", None),
+                getattr(self, "detail_stats", None),
+                target=getattr(self, "batch_count", None),
+            )
+        except Exception:
+            pass
         return kind
 
     def _record_success(self):
@@ -3364,8 +3875,24 @@ class GrokRegisterGUI:
         if lock:
             with lock:
                 self.success_count += 1
+                if not hasattr(self, "detail_stats") or self.detail_stats is None:
+                    self.detail_stats = empty_detail_stats()
+                self.detail_stats["register_ok"] = int(self.detail_stats.get("register_ok") or 0) + 1
         else:
             self.success_count += 1
+            if not hasattr(self, "detail_stats") or self.detail_stats is None:
+                self.detail_stats = empty_detail_stats()
+            self.detail_stats["register_ok"] = int(self.detail_stats.get("register_ok") or 0) + 1
+        try:
+            push_live_run_stats(
+                self.success_count,
+                self.fail_count,
+                getattr(self, "fail_stats", None),
+                getattr(self, "detail_stats", None),
+                target=getattr(self, "batch_count", None),
+            )
+        except Exception:
+            pass
 
     def _set_running_ui(self, running):
         if self._queue_ui_call(self._set_running_ui, running):
@@ -3510,9 +4037,17 @@ class GrokRegisterGUI:
         self.success_count = 0
         self.fail_count = 0
         self.fail_stats = empty_fail_stats()
+        self.detail_stats = empty_detail_stats()
         self.results = []
         self.batch_count = count
         self._batch_started_at = time.time()
+        try:
+            _rlp = start_run_log("gui", force_new=True)
+            if _rlp:
+                self.log(f"[*] run log -> {_rlp}")
+            update_run_stats(target=int(count or 0))
+        except Exception:
+            pass
         self.progress_var.set(0)
         self.eta_var.set(f"进度 0/{count} | ETA --")
         self.update_stats()
@@ -3596,6 +4131,20 @@ class GrokRegisterGUI:
                 f"[*] 任务结束。成功 {self.success_count} | 失败 {self.fail_count}"
                 + (f" | {format_fail_stats(self.fail_stats)}" if self.fail_count else "")
             )
+            self.log(format_current_stats_line(self.success_count, self.fail_count, self.detail_stats))
+            try:
+                reason = "user_stop" if self.stop_requested else "completed"
+                update_run_stats(
+                    success=int(self.success_count),
+                    fail=int(self.fail_count),
+                    fail_stats=dict(self.fail_stats or {}),
+                    detail_stats=dict(self.detail_stats or {}),
+                    target=int(self.batch_count or 0),
+                    completed=int(self.success_count) + int(self.fail_count),
+                )
+                finalize_run_log(reason)
+            except Exception:
+                pass
 
     def run_registration(self, count, worker_id=0, workers=1):
         prefix = f"[W{worker_id + 1}] " if workers > 1 else ""
@@ -3630,6 +4179,7 @@ class GrokRegisterGUI:
                 if self.should_stop():
                     break
                 wlog(f"--- 开始第 {i + 1}/{count} 个账号 ---")
+                sso_obtained = False
                 try:
                     email = ""
                     dev_token = ""
@@ -3668,6 +4218,10 @@ class GrokRegisterGUI:
                             msg = str(mail_exc)
                             if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
                                 wlog(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
+                                try:
+                                    release_outlook_alias_if_needed(email, dev_token)
+                                except Exception:
+                                    pass
                                 restart_browser(log_callback=wlog)
                                 sleep_with_cancel(1, self.should_stop)
                                 continue
@@ -3681,6 +4235,16 @@ class GrokRegisterGUI:
                         log_callback=wlog, cancel_callback=self.should_stop
                     )
                     wlog(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
+                    try:
+                        persist_registered_email(
+                            email,
+                            profile.get("password", ""),
+                            sso="",
+                            keep_existing_sso_if_empty=True,
+                            log_callback=wlog,
+                        )
+                    except Exception:
+                        pass
                     wlog("[*] 5. 等待 sso cookie")
                     sso = wait_for_sso_cookie(
                         log_callback=wlog,
@@ -3688,7 +4252,7 @@ class GrokRegisterGUI:
                         email=email,
                         password=profile.get("password", ""),
                     )
-                    ensure_sso_oauth_eligible(sso, email=email, log_callback=wlog)
+                    sso_obtained = True
                     if config.get("enable_nsfw", True):
                         wlog("[*] 6. 开启 NSFW（失败不阻塞入库）")
                         try:
@@ -3711,6 +4275,13 @@ class GrokRegisterGUI:
                                 atomic_write_text(email_file, line)
                         else:
                             atomic_write_text(email_file, line)
+                        persist_registered_email(
+                            email,
+                            profile.get("password", ""),
+                            sso=sso,
+                            keep_existing_sso_if_empty=False,
+                            log_callback=wlog,
+                        )
                     except Exception as file_exc:
                         wlog(f"[!] 保存账号文件失败，当前账号不计为成功: {file_exc}")
                         _append_sso_pending(email, sso, log_callback=wlog)
@@ -3721,8 +4292,31 @@ class GrokRegisterGUI:
                             self.results.append({"email": email, "sso": sso, "profile": profile})
                     else:
                         self.results.append({"email": email, "sso": sso, "profile": profile})
-                    cpa_ok = add_sso_to_cpa(sso, email=email, log_callback=wlog)
+                    bump_detail_stats(
+                        getattr(self, "detail_stats", None),
+                        "sso_ok",
+                        lock=getattr(self, "_stats_lock", None),
+                    )
+                    cpa_ok = finalize_sso_after_register(
+                        sso,
+                        email=email,
+                        log_callback=wlog,
+                        detail_stats=getattr(self, "detail_stats", None),
+                        detail_lock=getattr(self, "_stats_lock", None),
+                    )
+                    try:
+                        release_proxy_lease(getattr(self, "_worker_id", 0), rewind=False)
+                    except Exception:
+                        pass
                     self._record_success()
+                    self.update_stats()
+                    wlog(
+                        format_current_stats_line(
+                            self.success_count,
+                            self.fail_count,
+                            getattr(self, "detail_stats", None),
+                        )
+                    )
                     retry_count_for_slot = 0
                     i += 1
                     if cpa_ok:
@@ -3770,23 +4364,28 @@ class GrokRegisterGUI:
                     kind = self._record_failure(exc)
                     retry_count_for_slot = 0
                     i += 1
+                    try:
+                        release_outlook_alias_if_needed(locals().get("email") or "", locals().get("dev_token") or "")
+                    except Exception:
+                        pass
+                    try:
+                        release_proxy_lease(getattr(self, "_worker_id", 0), rewind=True)
+                    except Exception:
+                        pass
                     wlog(
                         f"[-] 注册失败 [{FAIL_LABELS.get(kind, kind)}]: "
                         f"{redact_sensitive_log_line(str(exc))}"
                     )
+                    if is_outlook_alias_pool_exhausted(exc):
+                        wlog("[!] Outlook 别名池已耗尽，停止本批剩余任务")
+                        self.stop_requested = True
+                        break
                 finally:
                     self.update_stats()
                 if self.should_stop():
                     break
                 # 每轮结束只关浏览器，不立刻再开。
-                # 下一轮 open_signup_page 会按需启动并导航到官网，避免空浏览器残留。
-                if i >= count:
-                    continue
-                # 账号间随机间隔
-                wait_sec = parse_account_interval()
-                if wait_sec > 0:
-                    wlog(f"[*] 下一个账号前等待 {wait_sec:.0f} 秒...")
-                    sleep_with_cancel(wait_sec, self.should_stop)
+                # 等待期间不保留 Camoufox，避免长间隔持续占用 Web Content 内存。
                 try:
                     stop_browser()
                     time.sleep(0.5)
@@ -3794,6 +4393,14 @@ class GrokRegisterGUI:
                     if self.should_stop():
                         break
                     wlog(f"[Debug] 轮次关闭浏览器失败: {close_exc}")
+                if i >= count:
+                    continue
+                # 账号间随机间隔
+                if sso_obtained:
+                    wait_sec = parse_account_interval()
+                    if wait_sec > 0:
+                        wlog(f"[*] 下一个账号前等待 {wait_sec:.0f} 秒...")
+                        sleep_with_cancel(wait_sec, self.should_stop, log_callback=wlog)
         except RegistrationCancelled:
             wlog("[!] 注册被用户停止")
         except Exception as exc:
@@ -3820,6 +4427,10 @@ class CliStopController:
 def cli_log(message):
     if not should_emit_log(message):
         return
+    try:
+        _tee_run_log(message)
+    except Exception:
+        pass
     from runtime_platform import beijing_strftime
 
     timestamp = beijing_strftime("%H:%M:%S")
@@ -3849,6 +4460,7 @@ def run_registration_cli(count):
     success_count = 0
     fail_count = 0
     fail_stats = empty_fail_stats()
+    detail_stats = empty_detail_stats()
     retry_count_for_slot = 0
     max_slot_retry = slot_retries()
     max_proxy_boot_rotations = proxy_boot_rotations()
@@ -3861,6 +4473,13 @@ def run_registration_cli(count):
     except Exception:
         pass
     pool = load_proxy_pool()
+    try:
+        _rlp = ensure_run_log("cli")
+        if _rlp:
+            cli_log(f"[*] run log -> {_rlp}")
+        update_run_stats(target=int(count or 0))
+    except Exception:
+        pass
     cli_log(
         f"[*] 终端模式启动，目标数量: {count} | 并发: {workers} | "
         f"代理池: {len(pool)} ({_proxy_pool_source})"
@@ -3880,13 +4499,23 @@ def run_registration_cli(count):
         startup_config = dict(config)
         if pool:
             startup_config["proxy"] = pool[0]
-        startup_checks = _conn.run_connectivity_checks(startup_config, http_get, http_post)
-        for name, ok, detail in startup_checks:
-            cli_log(
-                f"[检查] [{'OK' if ok else 'FAIL'}] {name}: "
-                f"{redact_sensitive_log_line(detail)}"
+        if config.get("skip_connectivity_precheck", True):
+            cli_log("[*] 已跳过启动连通性/测活预检")
+            startup_checks = []
+        else:
+            startup_checks = _conn.run_connectivity_checks(
+                startup_config, http_get, http_post
             )
-        if _conn.has_blocking_xai_failure(startup_checks):
+            for name, ok, detail in startup_checks:
+                cli_log(
+                    f"[检查] [{'OK' if ok else 'FAIL'}] {name}: "
+                    f"{redact_sensitive_log_line(detail)}"
+                )
+        if (
+            startup_checks
+            and not config.get("skip_xai_signup_precheck", True)
+            and _conn.has_blocking_xai_failure(startup_checks)
+        ):
             _record_proxy_precheck_failure(
                 str(startup_config.get("proxy") or ""),
                 startup_checks,
@@ -3897,6 +4526,8 @@ def run_registration_cli(count):
             except Exception:
                 pass
             _conn.require_xai_signup(startup_checks)
+        elif config.get("skip_xai_signup_precheck", True):
+            cli_log("[*] 已跳过 xAI 注册页预检")
     except _conn.XaiSignupPrecheckFailed:
         raise
     except Exception as exc:
@@ -3917,6 +4548,7 @@ def run_registration_cli(count):
         kind = classify_failure(exc)
         fail_count += 1
         fail_stats[kind] = fail_stats.get(kind, 0) + 1
+        note_failure_detail(detail_stats, kind)
         return kind
 
     if workers > 1:
@@ -3926,7 +4558,14 @@ def run_registration_cli(count):
         base, rem = divmod(count, workers)
         chunks = [base + (1 if i < rem else 0) for i in range(workers)]
         threads = []
-        shared = {"success": 0, "fail": 0, "fail_stats": empty_fail_stats()}
+        shared = {
+            "success": 0,
+            "fail": 0,
+            "fail_stats": empty_fail_stats(),
+            "detail_stats": empty_detail_stats(),
+        }
+        # workers 与汇总共用同一 detail 计数器
+        detail_stats = shared["detail_stats"]
 
         def worker(n, wid):
             local_success = 0
@@ -4023,16 +4662,21 @@ def run_registration_cli(count):
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                             cancel_callback=controller.should_stop,
                         )
+                        try:
+                            persist_registered_email(
+                                email,
+                                profile.get("password", ""),
+                                sso="",
+                                keep_existing_sso_if_empty=True,
+                                log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                            )
+                        except Exception:
+                            pass
                         sso = wait_for_sso_cookie(
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                             cancel_callback=controller.should_stop,
                             email=email,
                             password=profile.get("password", ""),
-                        )
-                        ensure_sso_oauth_eligible(
-                            sso,
-                            email=email,
-                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                         )
                         if config.get("enable_nsfw", True):
                             enable_nsfw_for_token(
@@ -4045,6 +4689,13 @@ def run_registration_cli(count):
                                 # 以邮箱命名单独保存
                                 email_file = account_file_for_email(email)
                                 atomic_write_text(email_file, line)
+                            persist_registered_email(
+                                email,
+                                profile.get("password", ""),
+                                sso=sso,
+                                keep_existing_sso_if_empty=False,
+                                log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                            )
                         except Exception as file_exc:
                             cli_log(
                                 f"[W{wid+1}] [!] 保存账号文件失败，当前账号不计为成功: {file_exc}"
@@ -4055,11 +4706,28 @@ def run_registration_cli(count):
                                 log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                             )
                             raise RuntimeError(f"保存账号文件失败: {file_exc}") from file_exc
-                        cpa_ok = add_sso_to_cpa(
-                            sso, email=email, log_callback=lambda m: cli_log(f"[W{wid+1}] {m}")
+                        bump_detail_stats(detail_stats, "sso_ok", lock=stats_lock)
+                        cpa_ok = finalize_sso_after_register(
+                            sso,
+                            email=email,
+                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                            detail_stats=detail_stats,
+                            detail_lock=stats_lock,
                         )
+                        try:
+                            release_proxy_lease(wid, rewind=False)
+                        except Exception:
+                            pass
                         local_success += 1
+                        bump_detail_stats(detail_stats, "register_ok", lock=stats_lock)
                         mark_successful_account()
+                        with stats_lock:
+                            _sc = int(shared["success"]) + local_success
+                            _fc = int(shared["fail"]) + local_fail
+                        cli_log(
+                            format_current_stats_line(_sc, _fc, detail_stats)
+                        )
+                        push_live_run_stats(_sc, _fc, None, detail_stats, target=count)
                         i += 1
                         retry = 0
                         if cpa_ok:
@@ -4116,6 +4784,20 @@ def run_registration_cli(count):
                             mark_slot_completed()
                     except Exception as exc:
                         msg = str(exc)
+                        if is_outlook_alias_pool_exhausted(exc):
+                            kind = classify_failure(exc)
+                            local_fail_stats[kind] = local_fail_stats.get(kind, 0) + 1
+                            local_fail += 1
+                            i += 1
+                            retry = 0
+                            cli_log(
+                                f"[W{wid+1}] [-] 失败 [{FAIL_LABELS.get(kind, kind)}]: "
+                                f"{redact_sensitive_log_line(msg)}"
+                            )
+                            cli_log(f"[W{wid+1}] [!] Outlook 别名池已耗尽，停止本批剩余任务")
+                            controller.stop()
+                            worker_stop = True
+                            break
                         blank_ui = (
                             "inputs=none" in msg
                             or "未找到邮箱输入框" in msg
@@ -4297,6 +4979,14 @@ def run_registration_cli(count):
                     shared["fail"] += local_fail
                     for k, v in local_fail_stats.items():
                         shared["fail_stats"][k] = shared["fail_stats"].get(k, 0) + v
+                        # 把 worker 内失败 kind 汇总进 detail（sso/risk/register 等）
+                        if v:
+                            note_failure_detail(shared["detail_stats"], k)
+                            # note_failure_detail only +1; fix for multi
+                            if v > 1:
+                                # re-apply remaining
+                                for _ in range(v - 1):
+                                    note_failure_detail(shared["detail_stats"], k)
 
         for wid, n in enumerate(chunks):
             if n <= 0:
@@ -4309,10 +4999,24 @@ def run_registration_cli(count):
         success_count = shared["success"]
         fail_count = shared["fail"]
         fail_stats = shared["fail_stats"]
+        detail_stats = shared.get("detail_stats") or detail_stats
         cli_log(
             f"[*] 任务结束。成功 {success_count} | 失败 {fail_count}"
             + (f" | {format_fail_stats(fail_stats)}" if fail_count else "")
         )
+        cli_log(format_current_stats_line(success_count, fail_count, detail_stats))
+        push_live_run_stats(success_count, fail_count, fail_stats, detail_stats, target=count)
+        try:
+            update_run_stats(
+                success=int(success_count),
+                fail=int(fail_count),
+                fail_stats=dict(fail_stats or {}),
+                detail_stats=dict(detail_stats or {}),
+                target=int(count or 0),
+                completed=int(success_count) + int(fail_count),
+            )
+        except Exception:
+            pass
         try:
             signal.signal(signal.SIGINT, _prev_sigint)
         except Exception:
@@ -4361,6 +5065,7 @@ def run_registration_cli(count):
             if controller.should_stop():
                 break
             cli_log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
+            sso_obtained = False
             try:
                 email = ""
                 dev_token = ""
@@ -4399,6 +5104,10 @@ def run_registration_cli(count):
                         msg = str(mail_exc)
                         if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
                             cli_log(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
+                            try:
+                                release_outlook_alias_if_needed(email, dev_token)
+                            except Exception:
+                                pass
                             restart_browser(log_callback=cli_log)
                             sleep_with_cancel(1, controller.should_stop)
                             continue
@@ -4412,6 +5121,16 @@ def run_registration_cli(count):
                     log_callback=cli_log, cancel_callback=controller.should_stop
                 )
                 cli_log(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
+                try:
+                    persist_registered_email(
+                        email,
+                        profile.get("password", ""),
+                        sso="",
+                        keep_existing_sso_if_empty=True,
+                        log_callback=cli_log,
+                    )
+                except Exception:
+                    pass
                 cli_log("[*] 5. 等待 sso cookie")
                 sso = wait_for_sso_cookie(
                     log_callback=cli_log,
@@ -4419,7 +5138,7 @@ def run_registration_cli(count):
                     email=email,
                     password=profile.get("password", ""),
                 )
-                ensure_sso_oauth_eligible(sso, email=email, log_callback=cli_log)
+                sso_obtained = True
                 if config.get("enable_nsfw", True):
                     cli_log("[*] 6. 开启 NSFW")
                     nsfw_ok, nsfw_msg = enable_nsfw_for_token(
@@ -4434,12 +5153,30 @@ def run_registration_cli(count):
                     # 以邮箱命名单独保存
                     email_file = account_file_for_email(email)
                     atomic_write_text(email_file, line)
+                    persist_registered_email(
+                        email,
+                        profile.get("password", ""),
+                        sso=sso,
+                        keep_existing_sso_if_empty=False,
+                        log_callback=cli_log,
+                    )
                 except Exception as file_exc:
                     cli_log(f"[!] 保存账号文件失败，当前账号不计为成功: {file_exc}")
                     _append_sso_pending(email, sso, log_callback=cli_log)
                     raise RuntimeError(f"保存账号文件失败: {file_exc}") from file_exc
-                cpa_ok = add_sso_to_cpa(sso, email=email, log_callback=cli_log)
+                bump_detail_stats(detail_stats, "sso_ok")
+                cpa_ok = finalize_sso_after_register(
+                    sso,
+                    email=email,
+                    log_callback=cli_log,
+                    detail_stats=detail_stats,
+                )
+                try:
+                    release_proxy_lease(0, rewind=False)
+                except Exception:
+                    pass
                 success_count += 1
+                bump_detail_stats(detail_stats, "register_ok")
                 mark_successful_account()
                 retry_count_for_slot = 0
                 i += 1
@@ -4458,7 +5195,8 @@ def run_registration_cli(count):
                 )
                 if success_count % 2 == 0:
                     single_rotate_idx += 1
-                cli_log(f"[*] 当前统计: 成功 {success_count} | 失败 {fail_count}")
+                cli_log(format_current_stats_line(success_count, fail_count, detail_stats))
+                push_live_run_stats(success_count, fail_count, fail_stats, detail_stats, target=count)
                 mark_slot_completed()
                 if success_count > 0 and success_count % MEMORY_CLEANUP_INTERVAL == 0 and i < count:
                     cleanup_runtime_memory(
@@ -4515,6 +5253,24 @@ def run_registration_cli(count):
                 retry_count_for_slot = 0
                 i += 1
                 message = str(exc)
+                if is_outlook_alias_pool_exhausted(exc):
+                    cli_log(
+                        f"[-] 注册失败 [{FAIL_LABELS.get(kind, kind)}]: "
+                        f"{redact_sensitive_log_line(message)}"
+                    )
+                    if kind != FAIL_RISK:
+                        record_register_result(
+                            "fail",
+                            email or "",
+                            kind=kind,
+                            detail=message,
+                            worker="W1",
+                            log_callback=cli_log,
+                        )
+                    mark_slot_completed()
+                    cli_log("[!] Outlook 别名池已耗尽，停止本批剩余任务")
+                    controller.stop()
+                    break
                 proxy_dead = any(
                     marker in message
                     for marker in (
@@ -4556,17 +5312,12 @@ def run_registration_cli(count):
                         log_callback=cli_log,
                     )
                 mark_slot_completed()
+                cli_log(format_current_stats_line(success_count, fail_count, detail_stats))
+                push_live_run_stats(success_count, fail_count, fail_stats, detail_stats, target=count)
             if controller.should_stop():
                 break
             # 每轮结束只关浏览器，不立刻再开。
-            # 下一轮 open_signup_page 会按需启动并导航到官网，避免空浏览器残留。
-            if i >= count:
-                continue
-            # 账号间随机间隔
-            wait_sec = parse_account_interval()
-            if wait_sec > 0:
-                cli_log(f"[*] 下一个账号前等待 {wait_sec:.0f} 秒...")
-                _sleep_cancelable(wait_sec, controller.should_stop)
+            # 等待期间不保留 Camoufox，避免长间隔持续占用 Web Content 内存。
             try:
                 stop_browser()
                 time.sleep(0.5)
@@ -4580,6 +5331,14 @@ def run_registration_cli(count):
                 if controller.should_stop():
                     break
                 cli_log(f"[Debug] 轮次关闭浏览器失败: {close_exc}")
+            if i >= count:
+                continue
+            # 账号间随机间隔
+            if sso_obtained:
+                wait_sec = parse_account_interval()
+                if wait_sec > 0:
+                    cli_log(f"[*] 下一个账号前等待 {wait_sec:.0f} 秒...")
+                    _sleep_cancelable(wait_sec, controller.should_stop, log_callback=cli_log)
             try:
                 px = pick_proxy_for_worker(0, single_rotate_idx)
                 set_thread_proxy(px)
@@ -4617,6 +5376,21 @@ def run_registration_cli(count):
             cli_log(
                 f"[*] 任务结束。成功 {success_count} | 失败 {fail_count}"
                 + (f" | {format_fail_stats(fail_stats)}" if fail_count else "")
+            )
+            cli_log(format_current_stats_line(success_count, fail_count, detail_stats))
+            push_live_run_stats(success_count, fail_count, fail_stats, detail_stats, target=count)
+        except BaseException:
+            pass
+        try:
+            reason = "user_stop" if controller.should_stop() else "child_finished"
+            update_run_stats(
+                success=int(success_count),
+                fail=int(fail_count),
+                fail_stats=dict(fail_stats or {}),
+                detail_stats=dict(detail_stats or {}),
+                target=int(count or 0),
+                completed=int(success_count) + int(fail_count),
+                notes=reason,
             )
         except BaseException:
             pass

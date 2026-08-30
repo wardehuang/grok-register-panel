@@ -27,6 +27,9 @@ SCHEMA_VERSION = 2
 HISTORY_SCHEMA_VERSION = 1
 HISTORY_LIMIT = 500
 HEADER_LIMIT = 64 * 1024
+HTTP_UPSTREAM_SCHEMES = frozenset({"http", "https"})
+SOCKS_UPSTREAM_SCHEMES = frozenset({"socks5", "socks5h", "socks"})
+METERABLE_SCHEMES = HTTP_UPSTREAM_SCHEMES | SOCKS_UPSTREAM_SCHEMES
 
 
 def _empty_metrics() -> dict:
@@ -338,6 +341,157 @@ def _rewrite_headers(head: bytes, authorization: bytes | None) -> bytes:
     return b"\r\n".join(output) + b"\r\n\r\n"
 
 
+def _origin_form_headers(head: bytes) -> bytes:
+    """Rewrite absolute-form proxy requests into origin-form for SOCKS tunnels."""
+    lines = head.split(b"\r\n")
+    if not lines:
+        raise ValueError("empty request head")
+    parts = lines[0].split(b" ")
+    if len(parts) < 3:
+        raise ValueError("malformed request line")
+    method, target, version = parts[0], parts[1], b" ".join(parts[2:])
+    if target.startswith(b"http://") or target.startswith(b"https://"):
+        parsed = urlparse(target.decode("utf-8", errors="replace"))
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        target = path.encode("utf-8", errors="replace")
+    output = [b" ".join((method, target, version))]
+    for line in lines[1:]:
+        lowered = line.lower()
+        if lowered.startswith(b"proxy-authorization:"):
+            continue
+        if lowered.startswith(b"proxy-connection:"):
+            continue
+        output.append(line)
+    return b"\r\n".join(output) + b"\r\n\r\n"
+
+
+def _parse_connect_target(target: bytes) -> tuple[str, int]:
+    text = target.decode("utf-8", errors="replace").strip()
+    if not text:
+        raise ValueError("empty CONNECT target")
+    if text.startswith("["):
+        host_end = text.find("]")
+        if host_end <= 1:
+            raise ValueError("invalid IPv6 CONNECT target")
+        host = text[1:host_end]
+        rest = text[host_end + 1 :]
+        if not rest.startswith(":") or not rest[1:].isdigit():
+            raise ValueError("invalid IPv6 CONNECT port")
+        return host, int(rest[1:])
+    if ":" not in text:
+        raise ValueError("CONNECT target missing port")
+    host, port_text = text.rsplit(":", 1)
+    if not host or not port_text.isdigit():
+        raise ValueError("invalid CONNECT target")
+    return host, int(port_text)
+
+
+def _parse_absolute_http_target(target: bytes) -> tuple[str, int, str]:
+    parsed = urlparse(target.decode("utf-8", errors="replace"))
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("unsupported absolute-form target")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+    return parsed.hostname, port, path
+
+
+def _recv_exact(sock: socket.socket, size: int) -> bytes:
+    data = bytearray()
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise ConnectionError("socket closed during SOCKS handshake")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def _socks5_connect(
+    *,
+    proxy_host: str,
+    proxy_port: int,
+    username: str,
+    password: str,
+    target_host: str,
+    target_port: int,
+    timeout: float = 15.0,
+) -> socket.socket:
+    """Open a TCP tunnel via SOCKS5, preferring remote DNS (domain ATYP)."""
+    if not proxy_host:
+        raise ValueError("upstream proxy host is missing")
+    if not target_host:
+        raise ValueError("SOCKS target host is missing")
+    if not (1 <= int(target_port) <= 65535):
+        raise ValueError("SOCKS target port out of range")
+
+    sock = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
+    try:
+        sock.settimeout(timeout)
+        user_b = username.encode("utf-8")
+        pass_b = password.encode("utf-8")
+        if len(user_b) > 255 or len(pass_b) > 255:
+            raise ValueError("SOCKS username/password too long")
+
+        methods = bytearray(b"\x05")
+        if user_b or pass_b:
+            methods.extend(b"\x02\x00\x02")  # no-auth + user/pass
+        else:
+            methods.extend(b"\x01\x00")  # no-auth only
+        sock.sendall(bytes(methods))
+        choice = _recv_exact(sock, 2)
+        if choice[0] != 0x05:
+            raise ConnectionError("invalid SOCKS version in method response")
+        if choice[1] == 0x02:
+            sock.sendall(
+                b"\x01"
+                + bytes([len(user_b)])
+                + user_b
+                + bytes([len(pass_b)])
+                + pass_b
+            )
+            auth = _recv_exact(sock, 2)
+            if auth[1] != 0x00:
+                raise ConnectionError("SOCKS5 authentication failed")
+        elif choice[1] != 0x00:
+            raise ConnectionError(f"SOCKS5 method rejected: {choice[1]}")
+
+        host_b = target_host.encode("idna")
+        if len(host_b) > 255:
+            raise ValueError("SOCKS target host too long")
+        req = (
+            b"\x05\x01\x00\x03"
+            + bytes([len(host_b)])
+            + host_b
+            + int(target_port).to_bytes(2, "big")
+        )
+        sock.sendall(req)
+        resp = _recv_exact(sock, 4)
+        if resp[0] != 0x05:
+            raise ConnectionError("invalid SOCKS version in connect response")
+        if resp[1] != 0x00:
+            raise ConnectionError(f"SOCKS5 connect failed: code={resp[1]}")
+        atyp = resp[3]
+        if atyp == 0x01:
+            _recv_exact(sock, 4 + 2)
+        elif atyp == 0x03:
+            ln = _recv_exact(sock, 1)[0]
+            _recv_exact(sock, ln + 2)
+        elif atyp == 0x04:
+            _recv_exact(sock, 16 + 2)
+        else:
+            raise ConnectionError(f"unsupported SOCKS ATYP: {atyp}")
+        return sock
+    except Exception:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        raise
+
+
 class _MeterHandler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         self.server.meter.handle_client(self.request)  # type: ignore[attr-defined]
@@ -352,10 +506,16 @@ class _ProxyMeter:
     def __init__(self, upstream_url: str, state: _TrafficState):
         parsed = urlparse(upstream_url)
         self.state = state
-        self.scheme = parsed.scheme
+        self.scheme = (parsed.scheme or "").lower()
         self.host = parsed.hostname or ""
-        self.port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if self.scheme in SOCKS_UPSTREAM_SCHEMES:
+            self.port = parsed.port or 1080
+        else:
+            self.port = parsed.port or (443 if self.scheme == "https" else 80)
+        self.username = unquote(parsed.username or "")
+        self.password = unquote(parsed.password or "")
         self.authorization = _proxy_authorization(parsed)
+        self.is_socks = self.scheme in SOCKS_UPSTREAM_SCHEMES
         self.local_username = "meter"
         self.local_password = secrets.token_urlsafe(18)
         self.local_authorization = _basic_authorization(
@@ -375,7 +535,7 @@ class _ProxyMeter:
             f"@127.0.0.1:{self.server.server_address[1]}"
         )
 
-    def _connect_upstream(self) -> socket.socket:
+    def _connect_http_upstream(self) -> socket.socket:
         if not self.host:
             raise ValueError("upstream proxy host is missing")
         upstream = socket.create_connection((self.host, self.port), timeout=15)
@@ -383,6 +543,17 @@ class _ProxyMeter:
             context = ssl.create_default_context()
             upstream = context.wrap_socket(upstream, server_hostname=self.host)
         return upstream
+
+    def _connect_socks_target(self, target_host: str, target_port: int) -> socket.socket:
+        return _socks5_connect(
+            proxy_host=self.host,
+            proxy_port=self.port,
+            username=self.username,
+            password=self.password,
+            target_host=target_host,
+            target_port=target_port,
+            timeout=15.0,
+        )
 
     def _send_error(self, client: socket.socket) -> None:
         try:
@@ -430,8 +601,37 @@ class _ProxyMeter:
                 self._send_proxy_auth_required(client)
                 return
             first_line = head.split(b"\r\n", 1)[0]
-            method = first_line.split(b" ", 1)[0].upper()
-            upstream = self._connect_upstream()
+            parts = first_line.split(b" ")
+            if len(parts) < 3:
+                raise ValueError("malformed request line")
+            method = parts[0].upper()
+            target = parts[1]
+
+            if self.is_socks:
+                if method == b"CONNECT":
+                    host, port = _parse_connect_target(target)
+                    upstream = self._connect_socks_target(host, port)
+                    upstream.settimeout(30)
+                    established = b"HTTP/1.1 200 Connection Established\r\n\r\n"
+                    client.sendall(established)
+                    self.state.update(bytes_down=len(established))
+                    tunnel_established = True
+                    if rest:
+                        upstream.sendall(rest)
+                        self.state.update(bytes_up=len(rest))
+                else:
+                    host, port, _path = _parse_absolute_http_target(target)
+                    upstream = self._connect_socks_target(host, port)
+                    upstream.settimeout(30)
+                    outbound = _origin_form_headers(head) + rest
+                    upstream.sendall(outbound)
+                    self.state.update(bytes_up=len(outbound))
+                client.settimeout(None)
+                upstream.settimeout(None)
+                self._relay(client, upstream)
+                return
+
+            upstream = self._connect_http_upstream()
             upstream.settimeout(30)
             outbound = _rewrite_headers(head, self.authorization)
             if method != b"CONNECT":
@@ -478,7 +678,8 @@ class _MeterManager:
 
     def wrap(self, upstream_url: str) -> str:
         parsed = urlparse(str(upstream_url or "").strip())
-        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        scheme = (parsed.scheme or "").lower()
+        if scheme not in METERABLE_SCHEMES or not parsed.hostname:
             key = hashlib.sha256(str(upstream_url or "").encode()).hexdigest()
             with self.lock:
                 if key not in self.unmetered:

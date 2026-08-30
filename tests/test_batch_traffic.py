@@ -222,7 +222,109 @@ def test_batch_history_is_private_idempotent_and_summarized():
         assert len(batch_traffic.read_history(history_path)["batches"]) == 2
 
 
+class FakeSocksUpstreamHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        sock = self.request
+        header = sock.recv(2)
+        assert header[0] == 0x05
+        nmethods = header[1]
+        methods = sock.recv(nmethods)
+        if 0x02 in methods:
+            sock.sendall(b"\x05\x02")
+            auth_ver = sock.recv(1)
+            assert auth_ver == b"\x01"
+            ulen = sock.recv(1)[0]
+            user = sock.recv(ulen)
+            plen = sock.recv(1)[0]
+            password = sock.recv(plen)
+            self.server.auths.append((user, password))  # type: ignore[attr-defined]
+            sock.sendall(b"\x01\x00")
+        else:
+            sock.sendall(b"\x05\x00")
+        req = sock.recv(4)
+        assert req[:2] == b"\x05\x01"
+        atyp = req[3]
+        if atyp == 0x03:
+            ln = sock.recv(1)[0]
+            host = sock.recv(ln)
+            port = int.from_bytes(sock.recv(2), "big")
+        else:
+            raise AssertionError(f"unexpected atyp {atyp}")
+        self.server.connects.append((host.decode(), port))  # type: ignore[attr-defined]
+        sock.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+        payload = sock.recv(4)
+        if payload == b"ping":
+            sock.sendall(b"pong")
+
+
+class FakeSocksUpstream(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def test_socks5_connect_metering():
+    previous_file = os.environ.get(batch_traffic.TRAFFIC_FILE_ENV)
+    previous_id = os.environ.get(batch_traffic.BATCH_ID_ENV)
+    upstream = FakeSocksUpstream(("127.0.0.1", 0), FakeSocksUpstreamHandler)
+    upstream.auths = []
+    upstream.connects = []
+    thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "batch_traffic.json"
+            batch_traffic.initialize_batch(path, "batch-socks", target=1, workers=1)
+            os.environ[batch_traffic.TRAFFIC_FILE_ENV] = str(path)
+            os.environ[batch_traffic.BATCH_ID_ENV] = "batch-socks"
+            proxy = (
+                f"socks5h://socks-user:socks-pass@127.0.0.1:{upstream.server_address[1]}"
+            )
+            meter = batch_traffic.meter_proxy_url(proxy)
+            assert meter.startswith("http://meter:")
+            assert meter != proxy
+
+            client = _connect_to_meter(meter)
+            client.sendall(
+                b"CONNECT example.test:443 HTTP/1.1\r\n"
+                b"Host: example.test:443\r\n"
+                + _meter_auth_header(meter)
+                + b"\r\nping"
+            )
+            connect_response = _read_headers(client)
+            assert b" 200 " in connect_response.split(b"\r\n", 1)[0]
+            assert client.recv(4) == b"pong"
+            client.close()
+
+            batch_traffic.close_runtime()
+            metrics = batch_traffic.read_metrics(path)
+            assert metrics["metered_proxies"] == 1
+            assert metrics["unmetered_proxies"] == 0
+            assert metrics["connections"] >= 1
+            assert metrics["bytes_up"] > 0
+            assert metrics["bytes_down"] > 0
+            assert upstream.auths == [(b"socks-user", b"socks-pass")]
+            assert upstream.connects == [("example.test", 443)]
+            state_text = path.read_text(encoding="utf-8")
+            assert "socks-user" not in state_text
+            assert "socks-pass" not in state_text
+            assert urlparse(meter).password not in state_text
+    finally:
+        batch_traffic.close_runtime()
+        upstream.shutdown()
+        upstream.server_close()
+        thread.join(timeout=5)
+        if previous_file is None:
+            os.environ.pop(batch_traffic.TRAFFIC_FILE_ENV, None)
+        else:
+            os.environ[batch_traffic.TRAFFIC_FILE_ENV] = previous_file
+        if previous_id is None:
+            os.environ.pop(batch_traffic.BATCH_ID_ENV, None)
+        else:
+            os.environ[batch_traffic.BATCH_ID_ENV] = previous_id
+
+
 if __name__ == "__main__":
     test_http_connect_metering_and_private_state()
     test_batch_history_is_private_idempotent_and_summarized()
+    test_socks5_connect_metering()
     print("OK batch traffic")

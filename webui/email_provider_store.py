@@ -26,7 +26,7 @@ PROVIDER_LABELS = {
     "mailnest": "MailNest",
     "cloudmail": "CloudMail",
     "moemail": "MoeMail",
-    "outlook_rt": "Outlook RT 库存",
+    "outlook_rt": "Outlook / Hotmail 别名库存",
 }
 SUPPORTED_PROVIDERS = tuple(PROVIDER_LABELS)
 
@@ -165,15 +165,23 @@ FIELD_DEFINITIONS = {
             {"value": 0, "label": "永久"},
         ],
     },
-    "outlook_rt_inventory": {
+    "outlook_accounts_file": {
         "label": "库存文件路径",
         "type": "text",
-        "placeholder": "/path/to/outlook_latest_50_with_rt.jsonl",
+        "default": "accounts/outlook_accounts.txt",
+        "placeholder": "accounts/outlook_accounts.txt",
     },
-    "outlook_rt_used_path": {
-        "label": "已用记录路径（可选）",
+    "outlook_state_file": {
+        "label": "使用记录 outlook_state.json",
         "type": "text",
-        "placeholder": "默认 inventory.used",
+        "default": "accounts/outlook_state.json",
+        "placeholder": "accounts/outlook_state.json",
+    },
+    "outlook_aliases_per_account": {
+        "label": "每账号别名上限",
+        "type": "text",
+        "default": 10,
+        "placeholder": "10",
     },
     "outlook_rt_client_id": {
         "label": "Client ID（可选）",
@@ -212,8 +220,9 @@ PROVIDER_FIELDS = {
         "moemail_expiry_ms",
     ),
     "outlook_rt": (
-        "outlook_rt_inventory",
-        "outlook_rt_used_path",
+        "outlook_accounts_file",
+        "outlook_state_file",
+        "outlook_aliases_per_account",
         "outlook_rt_client_id",
     ),
 }
@@ -349,11 +358,25 @@ def _normalize_value(name: str, value: object):
         if text and not re.fullmatch(r"[A-Za-z0-9._-]{8,80}", text):
             raise EmailProviderConfigError("Outlook Client ID 格式无效")
         return text
-    if name in {"outlook_rt_inventory", "outlook_rt_used_path"}:
+    if name in {
+        "outlook_rt_inventory",
+        "outlook_rt_used_path",
+        "outlook_accounts_file",
+        "outlook_state_file",
+    }:
         text = _string(value)
         if text and any(ch in text for ch in "\n\r\0"):
-            raise EmailProviderConfigError("库存路径无效")
+            raise EmailProviderConfigError("路径无效")
         return text
+    if name == "outlook_aliases_per_account":
+        text = _string(value) or str(definition.get("default") or 10)
+        try:
+            n = int(float(text))
+        except Exception as exc:
+            raise EmailProviderConfigError("别名上限必须是整数") from exc
+        if n < 1 or n > 100:
+            raise EmailProviderConfigError("别名上限范围 1-100")
+        return n
     return _string(value, strip=name != "cloudmail_password")
 
 
@@ -388,8 +411,15 @@ def _is_configured(provider: str, values: dict) -> bool:
     if provider == "moemail":
         return bool(values.get("moemail_api_base") and values.get("moemail_api_key"))
     if provider == "outlook_rt":
-        inventory = str(values.get("outlook_rt_inventory") or "").strip()
-        return bool(inventory and Path(inventory).expanduser().is_file())
+        accounts = str(values.get("outlook_accounts_file") or "").strip()
+        if not accounts:
+            accounts = str(values.get("outlook_rt_inventory") or "").strip()
+        if not accounts:
+            return False
+        path = Path(accounts).expanduser()
+        if not path.is_absolute():
+            path = (ROOT / path).resolve()
+        return path.is_file()
     return False
 
 
@@ -481,6 +511,12 @@ def save_email_provider_config(
         if error:
             raise RuntimeError(f"config.json 无法读取: {error}")
         updated = _candidate_config(raw, provider, settings, clear_secrets)
+        if str(updated.get("email_provider") or "") == "outlook_rt":
+            updated["outlook_use_alias_pool"] = True
+            if not str(updated.get("outlook_accounts_file") or "").strip():
+                updated["outlook_accounts_file"] = "accounts/outlook_accounts.txt"
+            if not str(updated.get("outlook_state_file") or "").strip():
+                updated["outlook_state_file"] = "accounts/outlook_state.json"
         atomic_write_json(CONFIG_PATH, updated)
     result = _public_state(updated)
     result["saved_at"] = _utc_now()
@@ -504,8 +540,20 @@ def test_email_provider_config(
     if http_get is None or http_post is None:
         import requests
 
-        http_get = http_get or requests.get
-        http_post = http_post or requests.post
+        session = requests.Session()
+        # 面板测试不要吃环境代理；缺省超时防止 UI 一直“正在测试连通性”
+        session.trust_env = False
+
+        def _session_get(url, **kwargs):
+            kwargs.setdefault("timeout", 15)
+            return session.get(url, **kwargs)
+
+        def _session_post(url, **kwargs):
+            kwargs.setdefault("timeout", 15)
+            return session.post(url, **kwargs)
+
+        http_get = http_get or _session_get
+        http_post = http_post or _session_post
     import connectivity
 
     _, ok, detail = connectivity.check_email_api(
