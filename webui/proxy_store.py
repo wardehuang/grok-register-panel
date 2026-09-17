@@ -35,8 +35,6 @@ LEGACY_PATH = Path(os.environ.get("PROXY_POOL_LEGACY_FILE", str(ROOT / "proxies.
 
 ALLOWED_SCHEMES = {"http", "https", "socks5", "socks5h"}
 ALLOWED_STATUSES = {"unknown", "healthy", "unhealthy", "cooldown"}
-MAX_IMPORT_ITEMS = 500
-MAX_TEST_ITEMS = 200
 DEFAULT_TEST_TIMEOUT = 8.0
 NETWORK_COOLDOWN_SECONDS = max(
     10, int(os.environ.get("PROXY_NETWORK_COOLDOWN_SECONDS", "90"))
@@ -537,9 +535,6 @@ def import_proxies(values: object, *, source: str = "panel") -> dict:
         text = line.strip()
         if not text or text.startswith("#"):
             continue
-        if len(candidates) >= MAX_IMPORT_ITEMS:
-            errors.append({"line": line_number, "error": f"单次最多导入 {MAX_IMPORT_ITEMS} 条"})
-            break
         try:
             normalized = normalize_proxy(text)
         except ProxyValidationError as exc:
@@ -935,7 +930,14 @@ def _run_test_job(job_id: str, selected: list[tuple[str, str]], timeout: float) 
                 _TEST_JOB["testing_ids"] = []
 
 
-def start_proxy_tests(ids: object = None, *, timeout: float = DEFAULT_TEST_TIMEOUT) -> dict:
+def start_proxy_tests(
+    ids: object = None,
+    *,
+    scope: str = "all",
+    timeout: float = DEFAULT_TEST_TIMEOUT,
+) -> dict:
+    if scope not in {"all", "attention"}:
+        raise ProxyValidationError("检测范围无效")
     requested = {
         str(value or "").strip()
         for value in (ids if isinstance(ids, (list, tuple, set)) else [])
@@ -949,12 +951,18 @@ def start_proxy_tests(ids: object = None, *, timeout: float = DEFAULT_TEST_TIMEO
             selected = [
                 (item["id"], item["url"])
                 for item in state["items"]
-                if (item["id"] in requested if requested else item["enabled"])
+                if (
+                    item["id"] in requested
+                    if requested
+                    else (
+                        item["status"] in {"unknown", "unhealthy", "cooldown"}
+                        if scope == "attention"
+                        else item["enabled"]
+                    )
+                )
             ]
         if not selected:
             return {"ok": False, "error": "没有可检测的代理"}
-        if len(selected) > MAX_TEST_ITEMS:
-            return {"ok": False, "error": f"单次最多检测 {MAX_TEST_ITEMS} 条代理"}
         job_id = hashlib.sha256(f"{time.time_ns()}:{len(selected)}".encode()).hexdigest()[:12]
         _TEST_JOB.update(
             {

@@ -24,6 +24,7 @@ tests=(
   tests/test_retry_policy.py
   tests/test_monitor_http.py
   tests/test_proxy_store.py
+  tests/test_intelligence_check.py
   tests/test_proxy_worker_integration.py
   tests/test_email_provider_store.py
   tests/test_outlook_rt.py
@@ -48,6 +49,7 @@ done
   browser_session.py \
   connectivity.py \
   grok_register_ttk.py \
+  intelligence_check.py \
   register_flow.py \
   runtime_platform.py \
   batch_supervisor.py \

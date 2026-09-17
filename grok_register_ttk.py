@@ -51,6 +51,11 @@ import connectivity as _conn
 from batch_supervisor import mark_slot_completed
 from batch_traffic import mark_successful_account
 import integrations_push
+from intelligence_check import (
+    IntelligenceProxyPoolExhausted,
+    ensure_intelligence_proxy_available,
+    run_intelligence_check,
+)
 import atexit
 atexit.register(lambda: stop_run_log())
 try:
@@ -147,6 +152,21 @@ MEMORY_CLEANUP_INTERVAL = 5
 
 _session_log_path = None
 _session_log_lock = threading.Lock()
+_intelligence_pool_exhausted = threading.Event()
+
+
+def require_registration_intelligence_proxy(log_callback=None) -> None:
+    if _intelligence_pool_exhausted.is_set():
+        if log_callback:
+            log_callback("[智商检测] 代理池已耗尽，停止本次注册流程")
+        raise IntelligenceProxyPoolExhausted("智商检测代理池已耗尽")
+    try:
+        ensure_intelligence_proxy_available()
+    except IntelligenceProxyPoolExhausted:
+        _intelligence_pool_exhausted.set()
+        if log_callback:
+            log_callback("[智商检测] 代理池为空，停止本次注册流程")
+        raise
 
 
 def ensure_accounts_dir():
@@ -1374,11 +1394,13 @@ def finalize_sso_after_register(
     detail_stats=None,
     detail_lock=None,
     only_cpa=False,
+    run_intelligence_gate=False,
 ) -> bool:
     """SSO 后处理顺序：
     1) 默认推送 grok2api Web + Console；only_cpa=True 时跳过
     2) 风控检查 botFlagSource
-    3) 通过才 Device Flow 换 token 并写/推 CPA
+    3) 通过才 Device Flow 换 token
+    4) 新账号注册执行智商检测，通过后才写/推 CPA
     风控失败：正常模式下已推 g2a；两种模式都不推 CPA，抛 RegistrationRiskDenied
     """
     sso = _normalize_sso_token(raw_token)
@@ -1428,7 +1450,14 @@ def finalize_sso_after_register(
     except RegistrationRiskDenied:
         bump_detail_stats(detail_stats, "risk_fail", lock=detail_lock)
         raise
-    cpa_ok = bool(add_sso_to_cpa(sso, email=email, log_callback=log_callback))
+    cpa_ok = bool(
+        add_sso_to_cpa(
+            sso,
+            email=email,
+            log_callback=log_callback,
+            run_intelligence_gate=run_intelligence_gate,
+        )
+    )
     bump_detail_stats(
         detail_stats,
         "cpa_ok" if cpa_ok else "cpa_fail",
@@ -1437,7 +1466,12 @@ def finalize_sso_after_register(
     return cpa_ok
 
 
-def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
+def add_sso_to_cpa(
+    raw_token,
+    email="",
+    log_callback=None,
+    run_intelligence_gate=False,
+) -> bool:
     """SSO → Device Flow 换 token → 写入 CPA（本地/远程）。
 
     调用前应已完成 grok2api SSO 推送与风控检查。
@@ -1527,6 +1561,21 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
             _cpa_log("换 token 失败；SSO 已在 accounts 文件，稍后可重转")
             _append_sso_pending(email, sso, log_callback=log_callback)
             return False
+
+        if run_intelligence_gate:
+            try:
+                intelligence_ok = run_intelligence_check(
+                    str(token.get("access_token") or ""),
+                    config["cpa_grok_version"],
+                    log_callback=log_callback,
+                )
+            except IntelligenceProxyPoolExhausted:
+                _intelligence_pool_exhausted.set()
+                _cpa_log("[智商检测] 代理池耗尽，不写入 CPA 本地/远程")
+                return False
+            if not intelligence_ok:
+                _cpa_log("[智商检测] 智商失败，不写入 CPA 本地/远程")
+                return False
 
         # JWT bfs 检测（与 botFlagSource 独立；key 存在即标记）
         bfs_check = config.get("bfs_check", True)
@@ -3678,6 +3727,8 @@ class GrokRegisterGUI:
             highlightbackground="#555555",
         )
         self.log_text.grid(row=0, column=0, sticky=tk.NSEW)
+        self.log_text.tag_configure("intelligence-degraded", foreground="#f27c71")
+        self.log_text.tag_configure("intelligence-healthy", foreground="#69c493")
         self.log("[*] GUI 已就绪，配置已加载")
         self.log(f"[*] 当前邮箱服务商: {self.email_provider_var.get()} | 注册数量: {self.count_var.get()}")
 
@@ -3725,7 +3776,18 @@ class GrokRegisterGUI:
         line = f"[{timestamp}] {message}"
         append_session_log(line)
         print(line, flush=True)
-        self.log_text.insert(tk.END, f"{line}\n")
+        if "× 【降智】" in line:
+            before, _marker, after = line.partition("× 【降智】")
+            self.log_text.insert(tk.END, before)
+            self.log_text.insert(tk.END, "×", "intelligence-degraded")
+            self.log_text.insert(tk.END, f" 【降智】{after}\n")
+        elif "√ 【非降智】" in line:
+            before, _marker, after = line.partition("√ 【非降智】")
+            self.log_text.insert(tk.END, before)
+            self.log_text.insert(tk.END, "√", "intelligence-healthy")
+            self.log_text.insert(tk.END, f" 【非降智】{after}\n")
+        else:
+            self.log_text.insert(tk.END, f"{line}\n")
         self.log_text.see(tk.END)
 
     def clear_log(self):
@@ -4013,6 +4075,11 @@ class GrokRegisterGUI:
         if config.get("cpa_auto_add") and not config.get("cpa_auth_dir") and not config.get("cpa_remote_url") and not config.get("grok2api_auth_dir"):
             self.log("[!] 已开启 SSO→auth，但未配置 CPA auth 目录 / 远程地址 / Grok2API 目录")
             return
+        _intelligence_pool_exhausted.clear()
+        try:
+            require_registration_intelligence_proxy(log_callback=self.log)
+        except IntelligenceProxyPoolExhausted:
+            return
         try:
             count = int(self.count_var.get())
         except Exception:
@@ -4178,6 +4245,11 @@ class GrokRegisterGUI:
             while i < count:
                 if self.should_stop():
                     break
+                try:
+                    require_registration_intelligence_proxy(log_callback=wlog)
+                except IntelligenceProxyPoolExhausted:
+                    self.stop_requested = True
+                    break
                 wlog(f"--- 开始第 {i + 1}/{count} 个账号 ---")
                 sso_obtained = False
                 try:
@@ -4303,7 +4375,10 @@ class GrokRegisterGUI:
                         log_callback=wlog,
                         detail_stats=getattr(self, "detail_stats", None),
                         detail_lock=getattr(self, "_stats_lock", None),
+                        run_intelligence_gate=True,
                     )
+                    if _intelligence_pool_exhausted.is_set():
+                        self.stop_requested = True
                     try:
                         release_proxy_lease(getattr(self, "_worker_id", 0), rewind=False)
                     except Exception:
@@ -4393,6 +4468,8 @@ class GrokRegisterGUI:
                     if self.should_stop():
                         break
                     wlog(f"[Debug] 轮次关闭浏览器失败: {close_exc}")
+                if not sso_obtained:
+                    release_proxy_lease(getattr(self, "_worker_id", 0), rewind=True)
                 if i >= count:
                     continue
                 # 账号间随机间隔
@@ -4457,6 +4534,15 @@ def run_registration_cli(count):
         cli_log("[!] 收到 Ctrl+C，正在停止（再按一次强制中断）")
 
     signal.signal(signal.SIGINT, _on_sigint)
+    _intelligence_pool_exhausted.clear()
+    try:
+        require_registration_intelligence_proxy(log_callback=cli_log)
+    except IntelligenceProxyPoolExhausted:
+        try:
+            signal.signal(signal.SIGINT, _prev_sigint)
+        except Exception:
+            pass
+        raise
     success_count = 0
     fail_count = 0
     fail_stats = empty_fail_stats()
@@ -4636,7 +4722,16 @@ def run_registration_cli(count):
                 retry = 0
                 worker_stop = False
                 while i < n and not controller.should_stop() and not worker_stop:
+                    try:
+                        require_registration_intelligence_proxy(
+                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}")
+                        )
+                    except IntelligenceProxyPoolExhausted:
+                        controller.stop()
+                        worker_stop = True
+                        break
                     email = ""
+                    account_succeeded = False
                     try:
                         delay = reserve_signup_submit_slot()
                         if delay >= 0.5:
@@ -4713,7 +4808,10 @@ def run_registration_cli(count):
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                             detail_stats=detail_stats,
                             detail_lock=stats_lock,
+                            run_intelligence_gate=True,
                         )
+                        if _intelligence_pool_exhausted.is_set():
+                            controller.stop()
                         try:
                             release_proxy_lease(wid, rewind=False)
                         except Exception:
@@ -4744,6 +4842,7 @@ def run_registration_cli(count):
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                         )
                         mark_slot_completed()
+                        account_succeeded = True
                         # 每成功 3 个换 sticky / IP
                         if local_success % 3 == 0:
                             rotate_idx += 1
@@ -4897,6 +4996,8 @@ def run_registration_cli(count):
                         elif local_success > 0 and local_success % 3 == 0:
                             rotate_idx += 1
                     finally:
+                        if not account_succeeded:
+                            release_proxy_lease(wid, rewind=True)
                         if i < n and not controller.should_stop():
                             try:
                                 stop_browser()
@@ -5021,6 +5122,8 @@ def run_registration_cli(count):
             signal.signal(signal.SIGINT, _prev_sigint)
         except Exception:
             pass
+        if _intelligence_pool_exhausted.is_set():
+            raise IntelligenceProxyPoolExhausted("智商检测代理池已耗尽")
         return
 
     try:
@@ -5063,6 +5166,11 @@ def run_registration_cli(count):
         i = 0
         while i < count:
             if controller.should_stop():
+                break
+            try:
+                require_registration_intelligence_proxy(log_callback=cli_log)
+            except IntelligenceProxyPoolExhausted:
+                controller.stop()
                 break
             cli_log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
             sso_obtained = False
@@ -5170,7 +5278,10 @@ def run_registration_cli(count):
                     email=email,
                     log_callback=cli_log,
                     detail_stats=detail_stats,
+                    run_intelligence_gate=True,
                 )
+                if _intelligence_pool_exhausted.is_set():
+                    controller.stop()
                 try:
                     release_proxy_lease(0, rewind=False)
                 except Exception:
@@ -5331,6 +5442,8 @@ def run_registration_cli(count):
                 if controller.should_stop():
                     break
                 cli_log(f"[Debug] 轮次关闭浏览器失败: {close_exc}")
+            if not sso_obtained:
+                release_proxy_lease(0, rewind=True)
             if i >= count:
                 continue
             # 账号间随机间隔
@@ -5400,6 +5513,10 @@ def run_registration_cli(count):
             pass
 
 
+    if _intelligence_pool_exhausted.is_set():
+        raise IntelligenceProxyPoolExhausted("智商检测代理池已耗尽")
+
+
 def main_cli():
     load_config()
     _wire_runtime_modules()
@@ -5421,6 +5538,8 @@ def main_cli():
         return
     try:
         run_registration_cli(count)
+    except IntelligenceProxyPoolExhausted:
+        cli_log("[智商检测] 代理池耗尽，注册流程已停止")
     except KeyboardInterrupt:
         # 清理阶段仍可能漏出，保证 CLI 干净退出
         cli_log("[!] 已停止")

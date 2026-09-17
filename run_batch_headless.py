@@ -141,6 +141,9 @@ def _run_child(count: int, workers: int) -> int:
     )
     try:
         app.run_registration_cli(count)
+    except app.IntelligenceProxyPoolExhausted:
+        print("[batch] 智商检测代理池耗尽；批次停止", flush=True)
+        return PRECHECK_EXIT_CODE
     except connectivity.XaiSignupPrecheckFailed:
         print("[batch] xAI registration page precheck failed; batch stopped", flush=True)
         return PRECHECK_EXIT_CODE

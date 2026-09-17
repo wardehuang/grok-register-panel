@@ -332,6 +332,8 @@ def main(argv: list[str] | None = None) -> int:
                         log_callback=log,
                         heartbeat_sec=60.0,
                     )
+            elif not item["has_sso"]:
+                gr.release_proxy_lease(0, rewind=True)
 
     except Exception as fatal:
         report["error"] = str(fatal)[:400]

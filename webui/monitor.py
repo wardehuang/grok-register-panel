@@ -41,6 +41,16 @@ try:
         start_proxy_tests,
         update_proxy,
     )
+    from webui.quality_proxy_store import (
+        clear_quality_proxies,
+        delete_quality_proxy,
+        import_legacy_quality_proxies,
+        import_quality_proxies,
+        read_quality_proxy_pool,
+        reorder_quality_proxies,
+        start_quality_proxy_tests,
+        update_quality_proxy,
+    )
     from webui.email_domain_store import (
         delete_domain,
         import_domains,
@@ -115,6 +125,16 @@ except ImportError:  # running as script from webui/
         reorder_proxies,
         start_proxy_tests,
         update_proxy,
+    )
+    from quality_proxy_store import (  # type: ignore
+        clear_quality_proxies,
+        delete_quality_proxy,
+        import_legacy_quality_proxies,
+        import_quality_proxies,
+        read_quality_proxy_pool,
+        reorder_quality_proxies,
+        start_quality_proxy_tests,
+        update_quality_proxy,
     )
     from email_domain_store import (  # type: ignore
         delete_domain,
@@ -247,6 +267,7 @@ ORCH_SCRIPT = ROOT / "run_until_100.py"
 CONTROL_LOCK = threading.RLock()
 START_LOCK = threading.Lock()
 MAX_REQUEST_BODY = 64 * 1024
+MAX_PROXY_BATCH_BODY = 4 * 1024 * 1024
 
 RE_OK = re.compile(r"\[\+\] 注册成功")
 RE_FAIL = re.compile(r"\[-\] 失败")
@@ -1180,6 +1201,8 @@ HTML = r"""<!DOCTYPE html>
     font-weight: 620;
   }
   .ok { color: var(--ok); } .fail { color: var(--fail); } .warn { color: var(--warn); } .accent { color: var(--accent); }
+  .intelligence-log-degraded { color: var(--fail); font-weight: 800; }
+  .intelligence-log-healthy { color: var(--ok); font-weight: 800; }
   .section-head {
     min-height: 32px;
     display: flex;
@@ -1495,6 +1518,9 @@ HTML = r"""<!DOCTYPE html>
   .proxy-toggle { width: 16px; height: 16px; min-height: 0; accent-color: var(--accent); }
   .proxy-empty { padding: 38px 18px !important; color: var(--muted); text-align: center; }
   .proxy-job { color: var(--muted); font-size: 11px; }
+  .proxy-pagination { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 10px; }
+  .proxy-pagination button { min-height: 30px; padding: 5px 10px; font-size: 11px; }
+  .proxy-pagination-label { color: var(--muted); font-size: 11px; }
   body.sso-view-open { overflow: hidden; }
   body.sso-view-open #dashboard-view > :not(#sso-view) { display: none; }
   .sso-view {
@@ -2242,7 +2268,11 @@ HTML = r"""<!DOCTYPE html>
       <div class="proxy-view-heading">
         <div>
           <div class="page-title" id="proxy-view-title">外部代理池</div>
-          <p class="proxy-view-subtitle">凭据仅保存在本机；表格顺序就是运行与 Dry Run 的代理分配顺序</p>
+          <p class="proxy-view-subtitle" id="proxy-view-subtitle">凭据仅保存在本机；表格顺序就是运行与 Dry Run 的代理分配顺序</p>
+          <div class="button-group" role="tablist" aria-label="代理池类型">
+            <button type="button" class="primary" id="proxy-kind-register" onclick="setProxyPoolKind('register')">注册代理池</button>
+            <button type="button" id="proxy-kind-quality" onclick="setProxyPoolKind('quality')">智商检测代理池</button>
+          </div>
         </div>
         <span class="proxy-job mono" id="proxy-updated">等待读取</span>
       </div>
@@ -2261,7 +2291,7 @@ HTML = r"""<!DOCTYPE html>
           <textarea id="proxy-input" spellcheck="false" autocomplete="off" placeholder="http://user:password@host:port&#10;host:port:user:password"></textarea>
         </div>
         <div class="proxy-import-actions">
-          <p class="proxy-format">支持 http、https、socks5、socks5h，以及 host:port:user:password。导入后先检测，只有健康且启用的代理会分配给新账号。</p>
+          <p class="proxy-format" id="proxy-format">支持 http、https、socks5、socks5h，以及 host:port:user:password。导入后先检测，只有健康且启用的代理会分配给新账号。</p>
           <div class="button-group">
             <button class="primary" id="proxy-import-button" onclick="importProxyInput()">导入代理</button>
             <button id="proxy-legacy-button" onclick="importLegacyProxies()">导入 proxies.txt</button>
@@ -2277,15 +2307,20 @@ HTML = r"""<!DOCTYPE html>
             <div class="proxy-job">使用“上移 / 下移”调整分配顺序，保存后下次分配立即生效</div>
             <div class="proxy-job mono" id="proxy-test-status" role="status" aria-live="polite">未开始检测</div>
           </div>
-          <button id="proxy-test-all" onclick="testProxies()">检测全部</button>
+          <div class="button-group">
+            <button id="proxy-test-attention" onclick="testProxies(null, 'attention')">检测异常/未检测</button>
+            <button id="proxy-test-all" onclick="testProxies()">检测全部</button>
+            <button class="danger" id="proxy-clear-quality" hidden onclick="clearQualityProxies()">删除全部</button>
+          </div>
         </div>
         <div class="proxy-table-wrap">
           <table class="proxy-table">
             <thead><tr><th>顺序</th><th>状态</th><th>代理端点</th><th>出口 / ASN</th><th>延迟</th><th>最近状态</th><th>启用</th><th>操作</th></tr></thead>
             <tbody id="proxy-body"><tr><td colspan="8" class="proxy-empty">正在读取代理池</td></tr></tbody>
-          </table>
-        </div>
-      </div>
+            </table>
+            </div>
+            <div class="proxy-pagination" id="proxy-pagination" aria-label="代理池分页" hidden></div>
+            </div>
     </div>
   </section>
 
@@ -2799,6 +2834,9 @@ HTML = r"""<!DOCTYPE html>
 let last = null;
 let proxyData = null;
 let proxyOrderSaving = false;
+let proxyPoolKind = "register";
+const PROXY_PAGE_SIZE = 100;
+let proxyPage = 1;
 let domainData = null;
 let emailProviderData = null;
 let selectedEmailProvider = "";
@@ -2990,6 +3028,11 @@ document.addEventListener("keydown", event => {
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
 }
+function renderRunLogLine(line) {
+  return esc(line)
+    .replace(/× (?=【降智】)/g, '<span class="intelligence-log-degraded">×</span> ')
+    .replace(/√ (?=【非降智】)/g, '<span class="intelligence-log-healthy">√</span> ');
+}
 function formatBytes(value) {
   const bytes = Math.max(0, Number(value) || 0);
   if (bytes < 1024) return Math.round(bytes) + " B";
@@ -3064,9 +3107,31 @@ function cooldownText(item) {
   const value = seconds >= 3600 ? Math.ceil(seconds / 3600) + " 小时" : Math.ceil(seconds / 60) + " 分钟";
   return (item.cooldown_reason === "risk" ? "风控冷却 " : "网络冷却 ") + value;
 }
+function proxyApiBase() {
+  return proxyPoolKind === "quality" ? "/api/quality-proxies" : "/api/proxies";
+}
+function setProxyPoolKind(kind) {
+  if (kind !== "register" && kind !== "quality") return;
+  proxyPoolKind = kind;
+  proxyPage = 1;
+  const quality = kind === "quality";
+  document.getElementById("proxy-kind-register").classList.toggle("primary", !quality);
+  document.getElementById("proxy-kind-quality").classList.toggle("primary", quality);
+  document.getElementById("proxy-view-title").textContent = quality ? "智商检测代理池" : "外部代理池";
+  document.getElementById("proxy-view-subtitle").textContent = quality
+    ? "独立用于 access_token 智商检测；每号独占一条，检测完成（含非降智）或网络错误/延迟超过 2000ms 时删除"
+    : "凭据仅保存在本机；表格顺序就是运行与 Dry Run 的代理分配顺序";
+  document.getElementById("proxy-format").textContent = quality
+    ? "支持格式和注册代理池一致。导入、检测、启停、排序和删除均保存在独立代理池。"
+    : "支持 http、https、socks5、socks5h，以及 host:port:user:password。导入后先检测，只有健康且启用的代理会分配给新账号。";
+  document.getElementById("proxy-clear-quality").hidden = !quality;
+  refreshProxies(false);
+}
 function renderProxyPool(data) {
   proxyData = data || {};
   const summary = proxyData.summary || {};
+  const items = proxyData.items || [];
+  const attentionCount = items.filter(item => ["unknown", "unhealthy", "cooldown"].includes(item.stored_status)).length;
   const values = [
     ["总数", summary.total ?? 0, ""],
     ["可用", summary.usable ?? 0, "ok"],
@@ -3085,14 +3150,23 @@ function renderProxyPool(data) {
   legacyButton.textContent = legacy.available ? ("导入 proxies.txt (" + (legacy.count || 0) + ")") : "无 proxies.txt";
 
   const job = proxyData.test_job || {};
+  const attentionButton = document.getElementById("proxy-test-attention");
   const testButton = document.getElementById("proxy-test-all");
+  attentionButton.disabled = !!job.running || attentionCount === 0;
   testButton.disabled = !!job.running || !(summary.enabled > 0);
+  const clearButton = document.getElementById("proxy-clear-quality");
+  clearButton.hidden = proxyPoolKind !== "quality";
+  clearButton.disabled = !!job.running || !(summary.total > 0);
   document.getElementById("proxy-test-status").textContent = job.running
     ? ("检测中 " + (job.completed || 0) + "/" + (job.total || 0) + "，健康 " + (job.healthy || 0) + "，失败 " + (job.failed || 0))
     : (job.finished_at ? ("上次检测：健康 " + (job.healthy || 0) + "，失败 " + (job.failed || 0)) : "未开始检测");
 
-  const items = proxyData.items || [];
-  document.getElementById("proxy-body").innerHTML = items.length ? items.map((item, index) => {
+  const pageCount = Math.max(1, Math.ceil(items.length / PROXY_PAGE_SIZE));
+  proxyPage = Math.min(Math.max(1, proxyPage), pageCount);
+  const pageStart = (proxyPage - 1) * PROXY_PAGE_SIZE;
+  const pageItems = items.slice(pageStart, pageStart + PROXY_PAGE_SIZE);
+  document.getElementById("proxy-body").innerHTML = pageItems.length ? pageItems.map((item, pageIndex) => {
+    const index = pageStart + pageIndex;
     const status = item.status || "unknown";
     const stateClass = ["healthy", "unhealthy", "cooldown", "testing"].includes(status) ? status : "";
     const exit = item.exit_ip ? esc(item.exit_ip) : "--";
@@ -3113,10 +3187,27 @@ function renderProxyPool(data) {
       <td><div class="proxy-actions"><button ${status === "testing" ? "disabled" : ""} onclick="testProxies('${item.id}')">检测</button><button class="danger" onclick="deleteProxyItem('${item.id}')">删除</button></div></td>
     </tr>`;
   }).join("") : '<tr><td colspan="8" class="proxy-empty">代理池为空，可在上方导入单条或批量代理</td></tr>';
+  renderProxyPagination(items.length, pageCount, pageStart, pageItems.length);
+}
+function renderProxyPagination(total, pageCount, pageStart, visibleCount) {
+  const box = document.getElementById("proxy-pagination");
+  if (total <= PROXY_PAGE_SIZE) {
+    box.hidden = true;
+    box.innerHTML = "";
+    return;
+  }
+  const pageEnd = pageStart + visibleCount;
+  box.hidden = false;
+  box.innerHTML = `<button ${proxyPage <= 1 ? "disabled" : ""} onclick="changeProxyPage(${proxyPage - 1})">上一页</button><span class="proxy-pagination-label">第 ${proxyPage} / ${pageCount} 页，${pageStart + 1}-${pageEnd} / ${total}</span><button ${proxyPage >= pageCount ? "disabled" : ""} onclick="changeProxyPage(${proxyPage + 1})">下一页</button>`;
+}
+function changeProxyPage(page) {
+  const pageCount = Math.max(1, Math.ceil((proxyData.items || []).length / PROXY_PAGE_SIZE));
+  proxyPage = Math.min(Math.max(1, page), pageCount);
+  renderProxyPool(proxyData);
 }
 async function refreshProxies(authHelp = false) {
   try {
-    const data = await api("/api/proxies?_=" + Date.now(), { authHelp });
+    const data = await api(proxyApiBase() + "?_=" + Date.now(), { authHelp });
     renderProxyPool(data);
     if (!data.ok && data.error) setMsg("proxy-msg", data.error, "err");
   } catch (e) {
@@ -3133,7 +3224,7 @@ function proxyImportMessage(result, prefix) {
 async function startImportedProxyTests(result) {
   const ids = result.imported_ids || [];
   if (!ids.length) return false;
-  await api("/api/proxies/test", { method: "POST", body: JSON.stringify({ ids }) });
+  await api(proxyApiBase() + "/test", { method: "POST", body: JSON.stringify({ ids }) });
   return true;
 }
 async function importProxyInput() {
@@ -3144,7 +3235,7 @@ async function importProxyInput() {
   button.disabled = true;
   setMsg("proxy-msg", "正在导入…", "");
   try {
-    const result = await api("/api/proxies/import", { method: "POST", body: JSON.stringify({ proxies: value }) });
+    const result = await api(proxyApiBase() + "/import", { method: "POST", body: JSON.stringify({ proxies: value }) });
     renderProxyPool(result);
     input.value = "";
     const testing = await startImportedProxyTests(result);
@@ -3157,7 +3248,7 @@ async function importLegacyProxies() {
   const button = document.getElementById("proxy-legacy-button");
   button.disabled = true;
   try {
-    const result = await api("/api/proxies/import", { method: "POST", body: JSON.stringify({ legacy: true }) });
+    const result = await api(proxyApiBase() + "/import", { method: "POST", body: JSON.stringify({ legacy: true }) });
     renderProxyPool(result);
     const testing = await startImportedProxyTests(result);
     setMsg("proxy-msg", proxyImportMessage(result, "已从 proxies.txt 导入 ") + (testing ? "，已开始检测" : ""), "ok");
@@ -3165,18 +3256,21 @@ async function importLegacyProxies() {
   } catch (e) { setMsg("proxy-msg", String(e.message || e), "err"); }
   button.disabled = false;
 }
-async function testProxies(id) {
+async function testProxies(id, scope) {
   const ids = id ? [id] : [];
-  setMsg("proxy-msg", id ? "正在检测该代理…" : "正在启动批量检测…", "");
+  const attention = scope === "attention";
+  setMsg("proxy-msg", id ? "正在检测该代理…" : (attention ? "正在检测异常/未检测代理…" : "正在启动批量检测…"), "");
   try {
-    await api("/api/proxies/test", { method: "POST", body: JSON.stringify({ ids }) });
+    const payload = { ids };
+    if (scope) payload.scope = scope;
+    await api(proxyApiBase() + "/test", { method: "POST", body: JSON.stringify(payload) });
     setMsg("proxy-msg", "检测任务已启动", "ok");
     await refreshProxies(false);
   } catch (e) { setMsg("proxy-msg", String(e.message || e), "err"); }
 }
 async function setProxyEnabled(id, enabled) {
   try {
-    const result = await api("/api/proxies/" + id, { method: "PATCH", body: JSON.stringify({ enabled }) });
+    const result = await api(proxyApiBase() + "/" + id, { method: "PATCH", body: JSON.stringify({ enabled }) });
     renderProxyPool(result);
     setMsg("proxy-msg", enabled ? "代理已启用" : "代理已停用", "ok");
   } catch (e) {
@@ -3194,7 +3288,7 @@ async function moveProxyItem(id, direction) {
   [ids[index], ids[targetIndex]] = [ids[targetIndex], ids[index]];
   proxyOrderSaving = true;
   try {
-    const result = await api("/api/proxies/reorder", {
+    const result = await api(proxyApiBase() + "/reorder", {
       method: "POST",
       body: JSON.stringify({ ids }),
     });
@@ -3211,9 +3305,20 @@ async function deleteProxyItem(id) {
   const item = (proxyData && proxyData.items || []).find(value => value.id === id);
   if (!confirm("删除代理 " + (item ? item.display_url : "") + "？")) return;
   try {
-    const result = await api("/api/proxies/" + id, { method: "DELETE" });
+    const result = await api(proxyApiBase() + "/" + id, { method: "DELETE" });
     renderProxyPool(result);
     setMsg("proxy-msg", "代理已删除", "ok");
+  } catch (e) { setMsg("proxy-msg", String(e.message || e), "err"); }
+}
+async function clearQualityProxies() {
+  if (proxyPoolKind !== "quality") return;
+  const total = Number((proxyData && proxyData.summary && proxyData.summary.total) || 0);
+  if (total <= 0) return;
+  if (!confirm("删除全部 " + total + " 条智商检测代理？此操作不可撤销。")) return;
+  try {
+    const result = await api("/api/quality-proxies", { method: "DELETE" });
+    renderProxyPool(result);
+    setMsg("proxy-msg", "已删除 " + (result.deleted_count || total) + " 条智商检测代理", "ok");
   } catch (e) { setMsg("proxy-msg", String(e.message || e), "err"); }
 }
 function currentEmailProviderDefinition(provider = selectedEmailProvider) {
@@ -4058,7 +4163,7 @@ async function refreshRunLog(forceBottom){
       const lines = j.lines || [];
       const text = lines.join("\n");
       if(box.textContent !== text){
-        box.textContent = text;
+        box.innerHTML = lines.map(renderRunLogLine).join("\n");
         if(forceBottom || nearBottom) box.scrollTop = box.scrollHeight;
       }
     }
@@ -4802,7 +4907,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/health":
             self._json(200, {"ok": True})
             return
-        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/proxies", "/api/email-provider", "/api/email-domains", "/api/bfs", "/api/sso-state", "/api/integrations", "/api/run-log", "/api/email-provider/outlook-inventory", "/api/email-provider/outlook-state", "/api/email-provider/outlook-state/raw", "/api/auth-files", "/api/auth-files/raw", "/api/auth-files/zip", "/api/registered-emails", "/api/registered-emails/export", "/api/registered-emails/one", "/api/batch-relogin"):
+        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/proxies", "/api/quality-proxies", "/api/email-provider", "/api/email-domains", "/api/bfs", "/api/sso-state", "/api/integrations", "/api/run-log", "/api/email-provider/outlook-inventory", "/api/email-provider/outlook-state", "/api/email-provider/outlook-state/raw", "/api/auth-files", "/api/auth-files/raw", "/api/auth-files/zip", "/api/registered-emails", "/api/registered-emails/export", "/api/registered-emails/one", "/api/batch-relogin"):
             if not self._require_read():
                 return
         if u.path == "/api/status":
@@ -4849,6 +4954,12 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/proxies":
             try:
                 self._json(200, read_proxy_pool())
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/quality-proxies":
+            try:
+                self._json(200, read_quality_proxy_pool())
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
@@ -4993,7 +5104,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             body_limit = None
-            if u.path == "/api/sso-state/start":
+            if u.path in (
+                "/api/proxies/import",
+                "/api/quality-proxies/import",
+                "/api/proxies/test",
+                "/api/quality-proxies/test",
+            ):
+                body_limit = MAX_PROXY_BATCH_BODY
+            elif u.path == "/api/sso-state/start":
                 body_limit = 4 * 1024 * 1024
             elif u.path in (
                 "/api/email-provider/outlook-state",
@@ -5155,7 +5273,39 @@ class Handler(BaseHTTPRequestHandler):
             return
         if u.path == "/api/proxies/test":
             try:
-                result = start_proxy_tests(body.get("ids"))
+                result = start_proxy_tests(body.get("ids"), scope=body.get("scope", "all"))
+                if result.get("ok"):
+                    code = 202
+                elif result.get("running"):
+                    code = 409
+                else:
+                    code = 400
+                self._json(code, result)
+            except Exception as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/quality-proxies/reorder":
+            try:
+                result = reorder_quality_proxies(body.get("ids"))
+                self._json(200 if result.get("ok") else 400, result)
+            except ValueError as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/quality-proxies/import":
+            try:
+                if body.get("legacy") is True:
+                    result = import_legacy_quality_proxies()
+                else:
+                    result = import_quality_proxies(body.get("proxies"), source="panel")
+                self._json(200 if result.get("ok") else 400, result)
+            except Exception as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/quality-proxies/test":
+            try:
+                result = start_quality_proxy_tests(body.get("ids"), scope=body.get("scope", "all"))
                 if result.get("ok"):
                     code = 202
                 elif result.get("running"):
@@ -5336,8 +5486,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_PATCH(self):
         u = urlparse(self.path)
         proxy_match = re.fullmatch(r"/api/proxies/([a-f0-9]{20})", u.path)
+        quality_proxy_match = re.fullmatch(r"/api/quality-proxies/([a-f0-9]{20})", u.path)
         domain_match = re.fullmatch(r"/api/email-domains/([a-f0-9]{20})", u.path)
-        if proxy_match is None and domain_match is None:
+        if proxy_match is None and quality_proxy_match is None and domain_match is None:
             self._send(404, b"not found", "text/plain")
             return
         if not self._require_write():
@@ -5353,6 +5504,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if proxy_match is not None:
                 result = update_proxy(proxy_match.group(1), enabled=body.get("enabled"))
+            elif quality_proxy_match is not None:
+                result = update_quality_proxy(quality_proxy_match.group(1), enabled=body.get("enabled"))
             else:
                 result = update_domain(domain_match.group(1), enabled=body.get("enabled"))
             self._json(200 if result.get("ok") else 404, result)
@@ -5363,19 +5516,36 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         u = urlparse(self.path)
+        if u.path == "/api/quality-proxies":
+            if not self._require_write():
+                return
+            try:
+                result = clear_quality_proxies()
+                if result.get("ok"):
+                    code = 200
+                elif result.get("running"):
+                    code = 409
+                else:
+                    code = 400
+                self._json(code, result)
+            except Exception as exc:
+                self._json(500, {"ok": False, "error": redact_log_line(str(exc))})
+            return
         proxy_match = re.fullmatch(r"/api/proxies/([a-f0-9]{20})", u.path)
+        quality_proxy_match = re.fullmatch(r"/api/quality-proxies/([a-f0-9]{20})", u.path)
         domain_match = re.fullmatch(r"/api/email-domains/([a-f0-9]{20})", u.path)
-        if proxy_match is None and domain_match is None:
+        if proxy_match is None and quality_proxy_match is None and domain_match is None:
             self._send(404, b"not found", "text/plain")
             return
         if not self._require_write():
             return
         try:
-            result = (
-                delete_proxy(proxy_match.group(1))
-                if proxy_match is not None
-                else delete_domain(domain_match.group(1))
-            )
+            if proxy_match is not None:
+                result = delete_proxy(proxy_match.group(1))
+            elif quality_proxy_match is not None:
+                result = delete_quality_proxy(quality_proxy_match.group(1))
+            else:
+                result = delete_domain(domain_match.group(1))
             self._json(200 if result.get("ok") else 404, result)
         except Exception as exc:
             self._json(500, {"ok": False, "error": redact_log_line(str(exc))})

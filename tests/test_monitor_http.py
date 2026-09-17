@@ -19,6 +19,7 @@ from webui import email_domain_store
 from webui import email_provider_store
 from webui import process_utils
 from webui import proxy_store
+from webui import quality_proxy_store
 
 
 def test_compat_process_roots_require_existing_absolute_paths():
@@ -242,6 +243,107 @@ def test_proxy_api_auth_mutations_and_redaction():
             server.server_close()
             thread.join(timeout=5)
             proxy_store.STATE_PATH, proxy_store.LOCK_PATH, proxy_store.LEGACY_PATH = previous_paths
+            if previous_token is None:
+                os.environ.pop("MONITOR_TOKEN", None)
+            else:
+                os.environ["MONITOR_TOKEN"] = previous_token
+
+
+def test_quality_proxy_clear_all_auth_and_redaction():
+    token = "test-quality-clear-token-123456"
+    secret = "quality-secret-value-77"
+    previous_token = os.environ.get("MONITOR_TOKEN")
+    previous_paths = (
+        quality_proxy_store.STATE_PATH,
+        quality_proxy_store.LOCK_PATH,
+        quality_proxy_store.LEGACY_PATH,
+        proxy_store.STATE_PATH,
+        proxy_store.LOCK_PATH,
+        proxy_store.LEGACY_PATH,
+    )
+    with tempfile.TemporaryDirectory() as temp:
+        base_path = Path(temp)
+        quality_proxy_store.STATE_PATH = base_path / "log" / "quality_proxy_pool.json"
+        quality_proxy_store.LOCK_PATH = base_path / "log" / "quality_proxy_pool.json.lock"
+        quality_proxy_store.LEGACY_PATH = base_path / "quality-proxies.txt"
+        proxy_store.STATE_PATH = base_path / "log" / "proxy_pool.json"
+        proxy_store.LOCK_PATH = base_path / "log" / "proxy_pool.json.lock"
+        proxy_store.LEGACY_PATH = base_path / "proxies.txt"
+        os.environ["MONITOR_TOKEN"] = token
+        server = monitor.ThreadingHTTPServer(("127.0.0.1", 0), monitor.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+        try:
+            payload = json.dumps(
+                {"proxies": f"proxy.example:8080:worker:{secret}\nproxy.example:8081"}
+            ).encode("utf-8")
+            status, _, body = request(
+                base + "/api/quality-proxies/import",
+                token=token,
+                method="POST",
+                body=payload,
+            )
+            assert status == 200
+            imported = json.loads(body)
+            assert imported["imported_count"] == 2
+            assert secret not in body.decode("utf-8")
+
+            register_payload = json.dumps({"proxies": "http://register.example:9000"}).encode("utf-8")
+            status, _, body = request(
+                base + "/api/proxies/import",
+                token=token,
+                method="POST",
+                body=register_payload,
+            )
+            assert status == 200
+            assert json.loads(body)["imported_count"] == 1
+
+            status, _, _ = request(base + "/api/quality-proxies", method="DELETE")
+            assert status == 401
+            status, _, _ = request(base + "/api/proxies", token=token, method="DELETE")
+            assert status == 404
+
+            status, _, body = request(
+                base + "/api/quality-proxies",
+                token=token,
+                method="DELETE",
+            )
+            assert status == 200
+            cleared = json.loads(body)
+            assert cleared["ok"] is True
+            assert cleared["deleted_count"] == 2
+            assert cleared["summary"]["total"] == 0
+            assert cleared["items"] == []
+            assert secret not in body.decode("utf-8")
+
+            status, _, body = request(base + "/api/quality-proxies", token=token)
+            assert status == 200
+            assert json.loads(body)["summary"]["total"] == 0
+
+            status, _, body = request(base + "/api/proxies", token=token)
+            assert status == 200
+            assert json.loads(body)["summary"]["total"] == 1
+
+            status, _, body = request(
+                base + "/api/quality-proxies",
+                token=token,
+                method="DELETE",
+            )
+            assert status == 200
+            assert json.loads(body)["deleted_count"] == 0
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            (
+                quality_proxy_store.STATE_PATH,
+                quality_proxy_store.LOCK_PATH,
+                quality_proxy_store.LEGACY_PATH,
+                proxy_store.STATE_PATH,
+                proxy_store.LOCK_PATH,
+                proxy_store.LEGACY_PATH,
+            ) = previous_paths
             if previous_token is None:
                 os.environ.pop("MONITOR_TOKEN", None)
             else:
@@ -511,6 +613,7 @@ if __name__ == "__main__":
     test_monitor_http_auth_and_headers()
     test_panel_registration_env_enables_guarded_cache()
     test_proxy_api_auth_mutations_and_redaction()
+    test_quality_proxy_clear_all_auth_and_redaction()
     test_email_domain_api_auth_and_mutations()
     test_email_provider_api_auth_secret_masking_and_probe()
     test_non_loopback_requires_token()

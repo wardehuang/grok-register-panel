@@ -345,7 +345,7 @@ def main():
                 return_code = proc.poll()
                 log(f"  batch exited rc={return_code}")
                 if return_code == PRECHECK_EXIT_CODE:
-                    log("ORCH STOP xAI registration page precheck failed")
+                    log("ORCH STOP 注册前置门禁失败（xAI 注册页或智商检测代理池）")
                     return
                 if return_code not in (0, None):
                     consecutive_batch_failures += 1

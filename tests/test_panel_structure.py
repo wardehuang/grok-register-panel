@@ -130,10 +130,15 @@ def test_proxy_pool_panel_structure():
     assert 'function testProxies(' in mon
     assert 'function setProxyEnabled(' in mon
     assert 'function deleteProxyItem(' in mon
+    assert 'function clearQualityProxies(' in mon
+    assert 'id="proxy-clear-quality"' in html
+    assert html.count('onclick="clearQualityProxies()"') == 1
+    assert 'onclick="deleteAllProxies()"' not in html
     assert '/api/proxies/import' in mon
     assert '/api/proxies/test' in mon
     assert 'def do_PATCH(self):' in mon
     assert 'def do_DELETE(self):' in mon
+    assert '每号独占一条' in mon
     assert 'worker_proxy_snapshot as _managed_worker_proxy_snapshot' in worker
     assert 'pool = load_proxy_pool()' in worker
     assert '面板代理池没有健康且启用的代理' in worker
