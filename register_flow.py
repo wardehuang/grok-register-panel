@@ -60,6 +60,13 @@ def _reload_signup(log_callback=None, reason: str = "页面错误") -> bool:
 CF_FIRST_RETRY_AFTER = 3.0   # 检测到 CF 后 3 秒即开始尝试
 CF_RETRY_INTERVAL = 8.0      # 两次完整 getTurnstileToken 间隔（原 15s 过慢）
 CF_WAIT_LOG_INTERVAL = 5.0
+# 批量重登登录页：先等自动过盾，未过再点复选框，等待后再查 token
+SIGNIN_CF_GRACE_SEC = 10.0
+SIGNIN_CF_CLICK_INTERVAL = 2.5
+SIGNIN_CF_POST_CLICK_SEC = 3.0
+SIGNIN_CF_POLL_SEC = 0.8
+SIGNIN_CF_WAIT_SEC = 22.0
+_signin_cf_log = {"success": False, "fail_at": 0.0, "seen_at": 0.0, "click_at": 0.0, "passed_logged": False}
 PROFILE_TIMEOUT = 70         # 资料页总超时（含 Turnstile / OTP 未跳转）
 PROFILE_CF_MAX_ROUNDS = 3    # Turnstile 完整复用最大次数，超限换口
 PROFILE_PROBE_LOG_INTERVAL = 5.0
@@ -770,6 +777,7 @@ def login_and_get_sso(
         raise Exception("login_and_get_sso: email 无效")
     if not password_s:
         raise Exception("login_and_get_sso: password 为空")
+    _reset_signin_cf_click_log()
     open_signin_page(
         log_callback=log_callback,
         cancel_callback=cancel_callback,
@@ -1671,97 +1679,379 @@ try {
     raise Exception("Turnstile 获取 token 失败")
 
 
-def _try_click_turnstile_frame(log_callback=None):
-    """通过 Playwright frame API 点击 Turnstile checkbox。
+def _reset_signin_cf_click_log():
+    _signin_cf_log["success"] = False
+    _signin_cf_log["fail_at"] = 0.0
+    _signin_cf_log["seen_at"] = 0.0
+    _signin_cf_log["click_at"] = 0.0
+    _signin_cf_log["passed_logged"] = False
 
-    全链路诊断日志 + 多策略点击：
-    1. 遍历 frames 找到 Turnstile frame（日志输出找到/未找到 + frame URL）
-    2. 在 frame 内搜索 checkbox 元素（日志输出尝试了哪些选择器）
-    3. 找到则点击；未找到则走 body 坐标点击 fallback
-    4. frame 内点击失败则尝试 page 级 iframe 坐标点击
-    """
+
+def _signin_turnstile_state(raw_page) -> tuple:
+    """Return (solved, token_length, challenge_present)."""
+    token_length = 0
+    challenge_present = False
     try:
-        raw_page = page.raw_page
-    except Exception as exc:
-        if log_callback:
-            log_callback(f"[Debug] Turnstile 点击失败：无法获取 raw_page: {exc}")
-        return
+        response_inputs = raw_page.locator('input[name="cf-turnstile-response"]')
+        if response_inputs.count() > 0:
+            challenge_present = True
+            for index in range(response_inputs.count()):
+                value = response_inputs.nth(index).input_value(timeout=1000)
+                token_length = max(token_length, len(str(value or "").strip()))
+    except Exception:
+        pass
+    try:
+        if raw_page.locator(
+            'iframe[src*="turnstile"], iframe[src*="challenges.cloudflare.com"], '
+            'div.cf-turnstile, [data-sitekey], script[src*="turnstile"]'
+        ).count() > 0:
+            challenge_present = True
+    except Exception:
+        pass
+    if token_length >= 80:
+        return True, token_length, challenge_present
+    try:
+        for frame in raw_page.frames:
+            success_markers = frame.get_by_text(
+                re.compile(r"^\s*success!?\s*$", re.IGNORECASE)
+            )
+            for index in range(success_markers.count()):
+                if success_markers.nth(index).is_visible():
+                    return True, token_length, True
+    except Exception:
+        pass
+    return (not challenge_present), token_length, challenge_present
 
-    # ---- 遍历 Playwright frames 找到 Turnstile frame ----
-    turnstile_frame = None
-    all_frame_urls = []
-    for frame in raw_page.frames:
-        frame_url = str(frame.url or "")
-        all_frame_urls.append(frame_url[:80])
-        if "challenges.cloudflare.com" in frame_url or "turnstile" in frame_url.lower():
-            turnstile_frame = frame
+
+def _mouse_click_at(raw_page, click_x: float, click_y: float) -> None:
+    mouse = raw_page.mouse
+    mouse.move(click_x, click_y)
+    raw_page.wait_for_timeout(80)
+    mouse.down()
+    raw_page.wait_for_timeout(40)
+    mouse.up()
+
+
+def _click_box_checkbox_offsets(box: dict) -> list:
+    """Turnstile 复选框在组件左侧，给出一组绝对坐标候选。"""
+    left = float(box["x"])
+    top = float(box["y"])
+    width = max(float(box["width"]), 1.0)
+    height = max(float(box["height"]), 1.0)
+    return [
+        (left + min(28.0, width * 0.12), top + height * 0.50),
+        (left + 26.0, top + 30.0),
+        (left + min(32.0, width * 0.15), top + height * 0.55),
+        (left + 20.0, top + height * 0.45),
+        (left + width * 0.08, top + height * 0.50),
+    ]
+
+
+def _summarize_turnstile_click_notes(attempt_notes: list) -> str:
+    if not attempt_notes:
+        return "无目标元素"
+    timeout_count = sum(1 for note in attempt_notes if "TimeoutError" in note)
+    other_notes = [note for note in attempt_notes if "TimeoutError" not in note]
+    parts = []
+    if timeout_count:
+        parts.append(f"iframe超时x{timeout_count}")
+    for note in other_notes[:2]:
+        short_note = note if len(note) <= 72 else note[:69] + "..."
+        parts.append(short_note)
+    if not parts and attempt_notes:
+        first = attempt_notes[0]
+        parts.append(first if len(first) <= 72 else first[:69] + "...")
+    return "; ".join(parts)
+
+
+def _try_click_turnstile_checkbox(raw_page, log_callback=None, *, will_retry: bool = True) -> bool:
+    """点 Cloudflare Turnstile「Verify you are human」复选框。
+
+    跨域 iframe 经常读不到内部 DOM，优先对可见宿主做绝对坐标鼠标点击。
+    """
+    solved, _token_length, challenge_present = _signin_turnstile_state(raw_page)
+    if solved or not challenge_present:
+        return False
+
+    attempt_notes = []
+    clicked = False
+    click_method = ""
+    host_selectors = (
+        'iframe[src*="challenges.cloudflare.com"]',
+        'iframe[src*="turnstile"]',
+        'iframe[title*="Widget containing"]',
+        'iframe[title*="Cloudflare"]',
+        "div.cf-turnstile",
+        "[data-sitekey]",
+        'div[id^="cf-turnstile"]',
+    )
+    for host_selector in host_selectors:
+        try:
+            hosts = raw_page.locator(host_selector)
+            host_count = hosts.count()
+        except Exception as exc:
+            attempt_notes.append(f"{host_selector}:count-fail:{exc.__class__.__name__}")
+            continue
+        if host_count <= 0:
+            continue
+        for host_index in range(host_count):
+            host = hosts.nth(host_index)
+            try:
+                if not host.is_visible():
+                    attempt_notes.append(f"{host_selector}[{host_index}]:hidden")
+                    continue
+                try:
+                    host.scroll_into_view_if_needed(timeout=1500)
+                except Exception:
+                    pass
+                box = host.bounding_box(timeout=1500)
+                if (
+                    not box
+                    or float(box.get("width") or 0) < 10
+                    or float(box.get("height") or 0) < 10
+                ):
+                    attempt_notes.append(f"{host_selector}[{host_index}]:box={box}")
+                    continue
+                for click_x, click_y in _click_box_checkbox_offsets(box):
+                    try:
+                        _mouse_click_at(raw_page, click_x, click_y)
+                        clicked = True
+                        click_method = (
+                            f"mouse@{click_x:.0f},{click_y:.0f}"
+                            f" via {host_selector}[{host_index}]"
+                            f" box={float(box['width']):.0f}x{float(box['height']):.0f}"
+                        )
+                        break
+                    except Exception as exc:
+                        attempt_notes.append(f"mouse-fail:{exc.__class__.__name__}:{exc}")
+                if clicked:
+                    break
+                try:
+                    host.click(
+                        timeout=1500,
+                        position={"x": 28, "y": max(12.0, float(box["height"]) / 2.0)},
+                        force=True,
+                        no_wait_after=True,
+                    )
+                    clicked = True
+                    click_method = f"host.click {host_selector}[{host_index}]"
+                    break
+                except Exception as exc:
+                    attempt_notes.append(
+                        f"host.click-fail:{host_selector}[{host_index}]:{exc.__class__.__name__}"
+                    )
+            except Exception as exc:
+                attempt_notes.append(f"{host_selector}[{host_index}]:{exc.__class__.__name__}")
+            if clicked:
+                break
+        if clicked:
             break
 
-    if not turnstile_frame:
-        if log_callback:
-            log_callback(
-                f"[Debug] Turnstile frame 未找到。当前 frames({len(all_frame_urls)}): "
-                f"{all_frame_urls}"
-            )
-        return
+    if not clicked:
+        iframe_selectors = (
+            'iframe[src*="challenges.cloudflare.com"]',
+            'iframe[src*="turnstile"]',
+            "div.cf-turnstile iframe",
+            'iframe[title*="Widget containing"]',
+            'iframe[title*="Cloudflare"]',
+        )
+        for iframe_selector in iframe_selectors:
+            try:
+                frame_root = raw_page.frame_locator(iframe_selector).first
+            except Exception as exc:
+                attempt_notes.append(f"frame_locator:{iframe_selector}:{exc.__class__.__name__}")
+                continue
+            for target_selector in (
+                'input[type="checkbox"]',
+                '[role="checkbox"]',
+                "label",
+                "body",
+            ):
+                try:
+                    target = frame_root.locator(target_selector).first
+                    if target_selector == "body":
+                        target.click(
+                            timeout=1500,
+                            position={"x": 28, "y": 28},
+                            force=True,
+                            no_wait_after=True,
+                        )
+                    else:
+                        target.click(timeout=1500, force=True, no_wait_after=True)
+                    clicked = True
+                    click_method = f"frame_locator {iframe_selector} → {target_selector}"
+                    break
+                except Exception as exc:
+                    attempt_notes.append(
+                        f"frame:{iframe_selector}/{target_selector}:{exc.__class__.__name__}"
+                    )
+            if clicked:
+                break
 
-    frame_url = str(turnstile_frame.url or "")
+    if not clicked:
+        try:
+            for frame in raw_page.frames:
+                frame_url = str(getattr(frame, "url", "") or "")
+                is_cf_frame = (
+                    "turnstile" in frame_url or "challenges.cloudflare" in frame_url
+                )
+                if not is_cf_frame:
+                    continue
+                for selector in (
+                    'input[type="checkbox"]',
+                    '[role="checkbox"]',
+                    "label",
+                    "body",
+                ):
+                    try:
+                        node = frame.locator(selector).first
+                        if selector == "body":
+                            node.click(
+                                timeout=1000,
+                                position={"x": 28, "y": 28},
+                                force=True,
+                                no_wait_after=True,
+                            )
+                        else:
+                            node.click(timeout=1000, force=True, no_wait_after=True)
+                        clicked = True
+                        click_method = f"frame.url click {selector}"
+                        break
+                    except Exception as exc:
+                        attempt_notes.append(
+                            f"frames[{frame_url[:48]}]/{selector}:{exc.__class__.__name__}"
+                        )
+                if clicked:
+                    break
+        except Exception as exc:
+            attempt_notes.append(f"frames-walk:{exc.__class__.__name__}")
+
     if log_callback:
-        log_callback(f"[Debug] Turnstile frame 已定位: {frame_url[:100]}")
+        try:
+            if clicked:
+                if not _signin_cf_log["success"]:
+                    log_callback(f"[*] 已点击 Cloudflare 复选框（{click_method}）")
+                    _signin_cf_log["success"] = True
+            else:
+                summary = _summarize_turnstile_click_notes(attempt_notes)
+                now_ts = time.time()
+                should_log_fail = (not will_retry) or (
+                    now_ts - float(_signin_cf_log["fail_at"] or 0.0) >= 8.0
+                )
+                if should_log_fail:
+                    _signin_cf_log["fail_at"] = now_ts
+                    if will_retry:
+                        log_callback(f"[*] 点击 Cloudflare 复选框未命中（{summary}），重试中…")
+                    else:
+                        log_callback(f"[!] 点击 Cloudflare 复选框失败（{summary}）")
+        except Exception:
+            pass
+    return clicked
 
-    # ---- 策略 1：frame body 坐标点击（Turnstile 实际交互方式）----
-    # Turnstile iframe 内没有 checkbox DOM 元素（inputs=[]），
-    # 交互区域是 canvas/overlay，只能通过坐标点击。
-    # checkbox 标准位置在 iframe 左侧 24px 处。
+
+def _raw_signin_page():
+    refresh_active_page()
+    current = active_page()
+    if current is None:
+        return None
     try:
-        body_info = turnstile_frame.evaluate(
-            """
-() => {
-  const b = document.body;
-  if (!b) return null;
-  const r = b.getBoundingClientRect();
-  return { w: r.width, h: r.height };
-}
-            """
-        )
+        return current.raw_page
+    except Exception:
+        return None
+
+
+def _try_click_turnstile_frame(log_callback=None):
+    """资料页 Turnstile：复用登录页同一套复选框点击。"""
+    raw_page = _raw_signin_page()
+    if raw_page is None:
         if log_callback:
-            bi = body_info or {}
-            log_callback(
-                f"[Debug] Turnstile frame body: w={bi.get('w', 0):.0f} h={bi.get('h', 0):.0f}"
+            log_callback("[Debug] Turnstile 点击失败：无法获取 raw_page")
+        return False
+    return _try_click_turnstile_checkbox(
+        raw_page, log_callback=log_callback, will_retry=True
+    )
+
+
+def _wait_signin_turnstile(log_callback=None, cancel_callback=None, timeout: float = 22.0) -> bool:
+    """登录页过盾：无挑战立即返回；有挑战先等自动通过，未过再点复选框并复查。"""
+    deadline = time.time() + max(float(timeout), 1.0)
+    grace_logged = False
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        raw_page = _raw_signin_page()
+        if raw_page is None:
+            return False
+        _solved, token_length, challenge_present = _signin_turnstile_state(raw_page)
+        if not challenge_present or token_length >= 80:
+            _signin_cf_log["seen_at"] = 0.0
+            if token_length >= 80 and log_callback and not _signin_cf_log["passed_logged"]:
+                log_callback(f"[*] 登录页 Cloudflare 已通过，token长度={token_length}")
+                _signin_cf_log["passed_logged"] = True
+            return True
+        now = time.time()
+        if float(_signin_cf_log["seen_at"] or 0.0) <= 0:
+            _signin_cf_log["seen_at"] = now
+        grace_elapsed = now - float(_signin_cf_log["seen_at"])
+        if grace_elapsed < SIGNIN_CF_GRACE_SEC:
+            if log_callback and not grace_logged:
+                log_callback(
+                    f"[*] 登录页检测到 Cloudflare，先等待自动过盾"
+                    f"（最多 {SIGNIN_CF_GRACE_SEC:.0f} 秒，token={token_length}）"
+                )
+                grace_logged = True
+            sleep_with_cancel(
+                min(SIGNIN_CF_POLL_SEC, SIGNIN_CF_GRACE_SEC - grace_elapsed),
+                cancel_callback,
             )
+            continue
+        since_click = now - float(_signin_cf_log["click_at"] or 0.0)
+        if since_click >= SIGNIN_CF_CLICK_INTERVAL:
+            if log_callback and float(_signin_cf_log["click_at"] or 0.0) <= 0:
+                log_callback("[*] 未自动过盾，点击 Cloudflare 复选框")
+            will_retry = (deadline - time.time()) > 5.0
+            clicked = _try_click_turnstile_checkbox(
+                raw_page,
+                log_callback=log_callback,
+                will_retry=will_retry,
+            )
+            _signin_cf_log["click_at"] = time.time()
+            sleep_with_cancel(
+                SIGNIN_CF_POST_CLICK_SEC if clicked else SIGNIN_CF_POLL_SEC,
+                cancel_callback,
+            )
+            continue
+        sleep_with_cancel(SIGNIN_CF_POLL_SEC, cancel_callback)
 
-        if not body_info or body_info.get("w", 0) <= 0:
-            if log_callback:
-                log_callback("[Debug] Turnstile frame body 未渲染好，跳过")
-            return
+    raw_page = _raw_signin_page()
+    if raw_page is None:
+        return False
+    _solved, token_length, challenge_present = _signin_turnstile_state(raw_page)
+    if not challenge_present or token_length >= 80:
+        _signin_cf_log["seen_at"] = 0.0
+        if token_length >= 80 and log_callback and not _signin_cf_log["passed_logged"]:
+            log_callback(f"[*] 登录页 Cloudflare 已通过，token长度={token_length}")
+            _signin_cf_log["passed_logged"] = True
+        return True
+    if log_callback:
+        log_callback(f"[!] 登录页 Cloudflare 仍未通过（token={token_length}），继续尝试登录")
+    return False
 
-        click_x = 24
-        click_y = body_info["h"] / 2
-        turnstile_frame.click("body", position={"x": click_x, "y": click_y}, timeout=3000)
-        if log_callback:
-            log_callback(f"[*] 已点击 Turnstile frame body ({click_x}, {click_y:.0f})")
-        return
-    except Exception as frame_click_exc:
-        if log_callback:
-            log_callback(f"[Debug] Turnstile frame body 点击失败: {frame_click_exc}")
 
-    # ---- 策略 2：page 级 iframe 元素坐标点击（frame 点击被 CSP 拦截时）----
-    try:
-        iframe_el = raw_page.query_selector(
-            'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]'
-        )
-        if iframe_el:
-            box = iframe_el.bounding_box()
-            if box and box["width"] > 0:
-                px = box["x"] + 24
-                py = box["y"] + box["height"] / 2
-                raw_page.mouse.click(px, py)
-                if log_callback:
-                    log_callback(f"[*] 已在 page 级点击 Turnstile iframe ({px:.0f}, {py:.0f})")
-                return
-    except Exception as page_click_exc:
-        if log_callback:
-            log_callback(f"[Debug] Turnstile page 级点击失败: {page_click_exc}")
+def _ensure_signin_cloudflare(log_callback=None, cancel_callback=None, deadline=None, *, quick=False) -> bool:
+    """批量重登：预算内等过盾。quick 且已经点过则只再查一小段。"""
+    if deadline is None:
+        timeout = SIGNIN_CF_WAIT_SEC
+    else:
+        timeout = min(SIGNIN_CF_WAIT_SEC, float(deadline) - time.time() - 6.0)
+    if quick and float(_signin_cf_log["seen_at"] or 0.0) > 0:
+        timeout = min(timeout, 6.0)
+    if timeout < 3.0:
+        return True
+    return _wait_signin_turnstile(
+        log_callback=log_callback,
+        cancel_callback=cancel_callback,
+        timeout=timeout,
+    )
 
 
 def build_profile():
@@ -2438,6 +2728,15 @@ return { hasEmail: !!emailInput, hasPwd: !!pwdInput };
                 f"[*] 登录表单 hasEmail={bool(fields.get('hasEmail'))} "
                 f"hasPwd={bool(fields.get('hasPwd'))}"
             )
+        if not fields.get("hasEmail") and not fields.get("hasPwd"):
+            _ensure_signin_cloudflare(
+                log_callback=log_callback,
+                cancel_callback=cancel_callback,
+                deadline=deadline,
+            )
+            fields = _signin_fields()
+            if not isinstance(fields, dict):
+                fields = {}
 
         # 1) 原生优先（真实键盘事件）
         filled_email = False
@@ -2570,6 +2869,13 @@ return setInputValue(pwdInput, password);
             if log_callback:
                 log_callback("[!] 自动登录：密码未写入，跳过提交")
             return ""
+
+        _ensure_signin_cloudflare(
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            deadline=deadline,
+            quick=True,
+        )
 
         # 3) 点登录 / 继续
         clicked = _native_click_action(
